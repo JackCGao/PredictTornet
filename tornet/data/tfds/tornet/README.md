@@ -4,7 +4,7 @@ This directory contains tensorflow_dataset `DatasetBuilder` class for tornet.  T
 
 To build dataset for TFDS
   
-1. Extract all tornet data into a directory `TORNET_ROOT`.  After extraction this directory should contain `catalog.csv, train/, test/`.  This assumes ALL the data was downloaded and extracted.  It that isn't the case, then the `splits` should be adjusted accordingly, but I didn't test running this with only a subset of TorNet.
+1. Extract all tornet data into a directory `TORNET_ROOT`.  After extraction this directory should contain `catalog.csv, train/, test/`.  Alternatively, some distributions place each year inside `TorNet <YEAR>` folders that each contain their own `catalog.csv`, `train/<YEAR>`, and `test/<YEAR>` subdirectories.  The builder automatically detects either layout.  This assumes ALL the data was downloaded and extracted.  It that isn't the case, then the `splits` should be adjusted accordingly, but I didn't test running this with only a subset of TorNet.
 
 2. Set env variables      
 ```

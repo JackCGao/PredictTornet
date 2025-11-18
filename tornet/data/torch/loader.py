@@ -10,6 +10,7 @@ The software/firmware is provided to you on an As-Is basis
 Delivered to the U.S. Government with Unlimited Rights, as defined in DFARS Part 252.227-7013 or 7014 (Feb 2014). Notwithstanding any copyright notice, U.S. Government rights in this work are defined by DFARS 252.227-7013 or DFARS 252.227-7014 as detailed above. Use of this work other than as specifically authorized by the U.S. Government may violate any copyrights that exist in this work.
 """
 
+from functools import partial
 from typing import Dict
 
 import numpy as np
@@ -26,6 +27,21 @@ def numpy_to_torch(d: Dict[str, np.ndarray]):
     for key, val in d.items():
         d[key] = torch.from_numpy(np.array(val))
     return d
+
+
+def _add_coordinates_torch(d, include_az, tilt_last):
+    return pp.add_coordinates(
+        d, include_az=include_az, tilt_last=tilt_last, backend=torch
+    )
+
+
+def _compute_sample_weight_transform(xy, **kwargs):
+    return pp.compute_sample_weight(*xy, backend=torch, **kwargs)
+
+
+def _select_keys_transform(xy, keys):
+    x_selected = pp.select_keys(xy[0], keys=keys)
+    return (x_selected,) + xy[1:]
 
 def make_torch_loader(data_root: str, 
                 data_type:str='train', # or 'test'
@@ -79,21 +95,22 @@ def make_torch_loader(data_root: str,
 
         # Assumes data was saved with tilt_last=True and converts it to tilt_last=False
         if not tilt_last:
-            transform_list.append(lambda d: pp.permute_dims(d,(0,3,1,2)))
+            transform_list.append(partial(pp.permute_dims, order=(0,3,1,2)))
 
-        transform_list.append(
-            lambda d: pp.remove_time_dim(d),
-            lambda d: pp.add_coordinates(d, include_az=include_az, tilt_last=tilt_last, backend=torch),
-            lambda d: pp.split_x_y(d)
+        transform_list.extend(
+            [
+                pp.remove_time_dim,
+                partial(_add_coordinates_torch, include_az=include_az, tilt_last=tilt_last),
+                pp.split_x_y,
+            ]
         )
 
         if weights:
-            transform_list.append(lambda xy: pp.compute_sample_weight(*xy, **weights, backend=torch))
+            weights_kwargs = dict(weights)
+            transform_list.append(partial(_compute_sample_weight_transform, **weights_kwargs))
         
         if select_keys is not None:
-            transform_list.append(
-                lambda xy: pp.select_keys(xy[0],keys=select_keys)+xy[1:]
-            )
+            transform_list.append(partial(_select_keys_transform, keys=select_keys))
             
          # Dataset, with preprocessing
         transform = transforms.Compose(transform_list)
@@ -105,19 +122,18 @@ def make_torch_loader(data_root: str,
         file_list = query_catalog(data_root, data_type, years, random_state)
 
         transform_list = [
-            lambda d: numpy_to_torch(d),
-            lambda d: pp.remove_time_dim(d),
-            lambda d: pp.add_coordinates(d, include_az=include_az, tilt_last=tilt_last, backend=torch),
-            lambda d: pp.split_x_y(d),
+            numpy_to_torch,
+            pp.remove_time_dim,
+            partial(_add_coordinates_torch, include_az=include_az, tilt_last=tilt_last),
+            pp.split_x_y,
         ]
 
         if weights:
-            transform_list.append(lambda xy: pp.compute_sample_weight(*xy, **weights, backend=torch))
+            weights_kwargs = dict(weights)
+            transform_list.append(partial(_compute_sample_weight_transform, **weights_kwargs))
         
         if select_keys is not None:
-            transform_list.append(
-                lambda xy: (pp.select_keys(xy[0],keys=select_keys),)+xy[1:]
-            )
+            transform_list.append(partial(_select_keys_transform, keys=select_keys))
 
         # Dataset, with preprocessing
         transform = transforms.Compose(transform_list)

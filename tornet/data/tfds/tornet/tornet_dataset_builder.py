@@ -56,32 +56,59 @@ class Builder(tfds.core.GeneratorBasedBuilder):
     
     # Assumes data is already downloaded and extracted from tar files
     # manual_dir should point to where tar files were extracted
-    archive_path = dl_manager.manual_dir
-    
-    # Defines the splits
-    # Returns the Dict[split names, Iterator[Key, Example]]
+    archive_path = pathlib.Path(dl_manager.manual_dir)
+
+    split_dirs = self._resolve_split_directories(archive_path)
+    if not split_dirs:
+      raise FileNotFoundError(
+          f'Could not find TorNet train/test directories under {archive_path}. '
+          'See README.md for the expected layout.')
+
     return {
-        'train-2013': self._generate_examples(archive_path / 'train/2013'),
-        'train-2014': self._generate_examples(archive_path / 'train/2014'),
-        'train-2015': self._generate_examples(archive_path / 'train/2015'),
-        'train-2016': self._generate_examples(archive_path / 'train/2016'),
-        'train-2017': self._generate_examples(archive_path / 'train/2017'),
-        'train-2018': self._generate_examples(archive_path / 'train/2018'),
-        'train-2019': self._generate_examples(archive_path / 'train/2019'),
-        'train-2020': self._generate_examples(archive_path / 'train/2020'),
-        'train-2021': self._generate_examples(archive_path / 'train/2021'),
-        'train-2022': self._generate_examples(archive_path / 'train/2022'),
-        'test-2013': self._generate_examples(archive_path / 'test/2013'),
-        'test-2014': self._generate_examples(archive_path / 'test/2014'),
-        'test-2015': self._generate_examples(archive_path / 'test/2015'),
-        'test-2016': self._generate_examples(archive_path / 'test/2016'),
-        'test-2017': self._generate_examples(archive_path / 'test/2017'),
-        'test-2018': self._generate_examples(archive_path / 'test/2018'),
-        'test-2019': self._generate_examples(archive_path / 'test/2019'),
-        'test-2020': self._generate_examples(archive_path / 'test/2020'),
-        'test-2021': self._generate_examples(archive_path / 'test/2021'),
-        'test-2022': self._generate_examples(archive_path / 'test/2022')
+        split_name: self._generate_examples(split_path)
+        for split_name, split_path in split_dirs
     }
+
+  def _resolve_split_directories(self, archive_path: pathlib.Path):
+    """Return a list of (split-name, path) tuples for the available data."""
+    split_dirs = []
+
+    def _add_split(split, year, path):
+      split_dirs.append((f'{split}-{year}', path))
+
+    # Layout 1: <root>/train/<year>, <root>/test/<year>
+    has_standard_layout = any(
+        (archive_path / split).exists() for split in ('train', 'test'))
+    if has_standard_layout:
+      for split in ('train', 'test'):
+        base = archive_path / split
+        if not base.exists():
+          continue
+        for year_dir in sorted(base.iterdir()):
+          if not year_dir.is_dir():
+            continue
+          try:
+            year = int(year_dir.name)
+          except ValueError:
+            continue
+          _add_split(split, year, year_dir)
+      return split_dirs
+
+    # Layout 2: <root>/TorNet <year>/<split>/<year>
+    for year_root in sorted(archive_path.glob('TorNet *')):
+      if not year_root.is_dir():
+        continue
+      parts = year_root.name.split()
+      try:
+        year = int(parts[-1])
+      except (ValueError, IndexError):
+        continue
+      for split in ('train', 'test'):
+        candidate = year_root / split / str(year)
+        if candidate.exists():
+          _add_split(split, year, candidate)
+
+    return split_dirs
 
   def _generate_examples(self, path):
     """Yields examples."""

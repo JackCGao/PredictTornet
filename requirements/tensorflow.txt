@@ -5,7 +5,7 @@ keras>=3.0
 tensorflow-datasets
 
 # Tensorflow CPU support
-tensorflow-cpu
+tensorflow-macos
 
 # Tensorflow with cuda support
 #tensorflow[and-cuda]~=2.16.1
