@@ -176,6 +176,39 @@ def _prepare_dataloader_kwargs(config: Dict) -> Dict:
     return dataloader_kwargs
 
 
+def _drop_missing_files(loader: DataLoader, loader_name: str) -> None:
+    """
+    Remove entries from the dataloader's file list if the files are missing on disk.
+
+    Some catalogs may contain stale paths; we quietly skip them so training can
+    continue with the remaining files.
+    """
+
+    dataset = getattr(loader, "dataset", None)
+    file_list = getattr(dataset, "file_list", None)
+    if not file_list:
+        return
+
+    missing = [f for f in file_list if not Path(f).exists()]
+    if not missing:
+        return
+
+    dataset.file_list = [f for f in file_list if Path(f).exists()]
+    logging.warning(
+        "%s dataloader: %d files listed in catalog were missing; skipping them. "
+        "First missing example: %s",
+        loader_name,
+        len(missing),
+        missing[0],
+    )
+
+    if not dataset.file_list:
+        raise RuntimeError(
+            f"All files referenced by the {loader_name} catalog are missing. "
+            "Cannot continue."
+        )
+
+
 def main(config: Dict):
     config = deepcopy(config)
     epochs = config.get("epochs")
@@ -215,6 +248,7 @@ def main(config: Dict):
         weights,
         **dataloader_kwargs,
     )
+    _drop_missing_files(ds_train_raw, "train")
     ds_val_raw = get_dataloader(
         dataloader_name,
         DATA_ROOT,
@@ -224,6 +258,7 @@ def main(config: Dict):
         weights,
         **dataloader_kwargs,
     )
+    _drop_missing_files(ds_val_raw, "validation")
     ds_train = _wrap_loader_for_lightning(ds_train_raw)
     ds_val = _wrap_loader_for_lightning(ds_val_raw)
 
