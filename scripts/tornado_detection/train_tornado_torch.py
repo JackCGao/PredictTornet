@@ -56,7 +56,7 @@ os.environ.setdefault("TMPDIR", str(TMP_DIR))
 os.environ.setdefault("TMP", str(TMP_DIR))
 os.environ.setdefault("TEMP", str(TMP_DIR))
 os.environ.setdefault("MPLCONFIGDIR", str(TMP_DIR / "matplotlib"))
-os.environ['TORNET_ROOT'] = "/Users/jackgao/Documents/TornadoSight/PredictTornet/tornet_raw"
+os.environ['TORNET_ROOT'] = "/Users/jackgao/Documents/TornadoSight/PredictTornet/tornet_raw/retagged_shift"
 DATA_ROOT = os.environ["TORNET_ROOT"]
 logging.info("TORNET_ROOT=%s", DATA_ROOT)
 

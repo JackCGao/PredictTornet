@@ -90,7 +90,7 @@ def remove_time_dim(d):
     Removes time dimension from data by taking last available frame
     """
     for v in d:
-        d[v] = d[v][-1]
+        d[v] = d[v][0]
     return d
 
 def add_batch_dim(data: Dict[str,np.ndarray]):
