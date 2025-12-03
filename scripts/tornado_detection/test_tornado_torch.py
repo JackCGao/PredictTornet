@@ -83,33 +83,42 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def _select_device(device_opt: str) -> torch.device:
     if device_opt == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
     return torch.device(device_opt)
+
+
+def _collate_with_labels(batch):
+    """Collate samples into a dict batch; defined at module level for Windows pickling."""
+
+    sample = batch[0]
+    has_weights = len(sample) == 3
+    feats = [x[0] for x in batch]
+    labels = [x[1] for x in batch]
+    weights = [x[2] for x in batch] if has_weights else None
+
+    feats = default_collate(feats)
+    feats["label"] = default_collate(labels)
+    if has_weights:
+        feats["sample_weights"] = default_collate(weights)
+    return feats
 
 
 def _wrap_loader(loader: DataLoader) -> DataLoader:
     """Convert (features, label[, weight]) -> dict batches for compatibility."""
-
-    def _collate(batch):
-        sample = batch[0]
-        has_weights = len(sample) == 3
-        feats = [x[0] for x in batch]
-        labels = [x[1] for x in batch]
-        weights = [x[2] for x in batch] if has_weights else None
-
-        feats = default_collate(feats)
-        feats["label"] = default_collate(labels)
-        if has_weights:
-            feats["sample_weights"] = default_collate(weights)
-        return feats
 
     return DataLoader(
         loader.dataset,
         batch_size=loader.batch_size,
         num_workers=loader.num_workers,
         pin_memory=loader.pin_memory,
-        persistent_workers=getattr(loader, "persistent_workers", False),
-        collate_fn=_collate,
+        persistent_workers=(
+            getattr(loader, "persistent_workers", False) and loader.num_workers > 0
+        ),
+        collate_fn=_collate_with_labels,
     )
 
 

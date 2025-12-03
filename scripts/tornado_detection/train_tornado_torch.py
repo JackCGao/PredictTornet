@@ -56,7 +56,8 @@ os.environ.setdefault("TMPDIR", str(TMP_DIR))
 os.environ.setdefault("TMP", str(TMP_DIR))
 os.environ.setdefault("TEMP", str(TMP_DIR))
 os.environ.setdefault("MPLCONFIGDIR", str(TMP_DIR / "matplotlib"))
-os.environ['TORNET_ROOT'] = "/Users/jackgao/Documents/TornadoSight/PredictTornet/tornet_raw/retagged_shift"
+if "TORNET_ROOT" not in os.environ:
+    raise RuntimeError("Please set TORNET_ROOT to the dataset root before training.")
 DATA_ROOT = os.environ["TORNET_ROOT"]
 logging.info("TORNET_ROOT=%s", DATA_ROOT)
 
@@ -132,7 +133,9 @@ def _wrap_loader_for_lightning(loader: DataLoader) -> DataLoader:
         shuffle=False,
         drop_last=False,
         pin_memory=loader.pin_memory,
-        persistent_workers=getattr(loader, "persistent_workers", False),
+        persistent_workers=(
+            getattr(loader, "persistent_workers", False) and loader.num_workers > 0
+        ),
         collate_fn=_lightning_collate,
     )
 
