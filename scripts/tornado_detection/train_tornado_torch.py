@@ -167,6 +167,17 @@ def _build_metrics() -> MetricCollection:
     )
 
 
+def _compute_csi(precision: float | None, recall: float | None) -> float | None:
+    """Compute Critical Success Index from precision and recall."""
+
+    if precision is None or recall is None:
+        return None
+    denom = precision + recall - (precision * recall)
+    if denom <= 0:
+        return None
+    return (precision * recall) / denom
+
+
 def _prepare_dataloader_kwargs(config: Dict) -> Dict:
     dataloader_kwargs = _clone_dict(config.get("dataloader_kwargs"))
     dataloader_kwargs.setdefault("tilt_last", False)
@@ -333,8 +344,18 @@ def main(config: Dict):
     best_metrics = val_results[0] if val_results else {}
     best_auc = float(best_metrics.get("val_AUC", 0.5))
     best_aucpr = float(best_metrics.get("val_AUCPR", 0.0))
-    logging.info("Best validation metrics: AUC=%f AUCPR=%f", best_auc, best_aucpr)
-    return {"AUC": best_auc, "AUCPR": best_aucpr}
+    best_precision = best_metrics.get("val_Precision")
+    best_recall = best_metrics.get("val_Recall")
+    best_precision = float(best_precision) if best_precision is not None else None
+    best_recall = float(best_recall) if best_recall is not None else None
+    best_csi = _compute_csi(best_precision, best_recall)
+    logging.info(
+        "Best validation metrics: AUC=%f AUCPR=%f CSI=%s",
+        best_auc,
+        best_aucpr,
+        f"{best_csi:.4f}" if best_csi is not None else "n/a",
+    )
+    return {"AUC": best_auc, "AUCPR": best_aucpr, "CSI": best_csi}
 
 
 if __name__ == "__main__":
