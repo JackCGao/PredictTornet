@@ -13,11 +13,12 @@ Delivered to the U.S. Government with Unlimited Rights, as defined in DFARS Part
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -31,6 +32,7 @@ from torchmetrics.classification import (
     BinaryF1Score,
     BinaryPrecision,
     BinaryRecall,
+    BinaryStatScores,
 )
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -51,8 +53,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate TorNet Torch model.")
     parser.add_argument(
         "--checkpoint",
-        required=True,
-        help="Path to a Lightning checkpoint (.ckpt) produced by train_tornado_torch.py.",
+        default=None,
+        help=(
+            "Path to a Lightning checkpoint (.ckpt) produced by train_tornado_torch.py. "
+            "If omitted, the script will try to use latest/checkpoints/last.ckpt under EXP_DIR "
+            "(default: current directory)."
+        ),
     )
     parser.add_argument(
         "--dataloader",
@@ -155,6 +161,77 @@ def _build_metrics(device: torch.device) -> MetricCollection:
         }
     ).to(device)
 
+def _compute_csi(tp: float, fp: float, fn: float) -> float | None:
+    denom = tp + fp + fn
+    if denom == 0:
+        return None
+    return float(tp / denom)
+
+def _load_training_config(checkpoint_path: Path) -> Dict[str, Any]:
+    """Load the training config saved alongside a checkpoint (params.json)."""
+
+    cfg_path = checkpoint_path.resolve().parent.parent / "params.json"
+    if not cfg_path.exists():
+        return {}
+    try:
+        data = json.load(open(cfg_path, "r"))
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Could not read training config at %s: %s", cfg_path, exc)
+        return {}
+
+    if isinstance(data, dict):
+        config = data.get("config", data)
+        return config if isinstance(config, dict) else {}
+    return {}
+
+def _drop_missing_files(loader: DataLoader, loader_name: str) -> None:
+    """
+    Remove entries from the dataloader's file list if the files are missing on disk.
+
+    Some catalogs may contain stale paths; we quietly skip them so evaluation can
+    continue with the remaining files.
+    """
+
+    dataset = getattr(loader, "dataset", None)
+    file_list = getattr(dataset, "file_list", None)
+    if not file_list:
+        return
+
+    missing = [f for f in file_list if not Path(f).exists()]
+    if not missing:
+        return
+
+    dataset.file_list = [f for f in file_list if Path(f).exists()]
+    logging.warning(
+        "%s dataloader: %d files listed in catalog were missing; skipping them. "
+        "First missing example: %s",
+        loader_name,
+        len(missing),
+        missing[0],
+    )
+
+    if not dataset.file_list:
+        raise RuntimeError(
+            f"All files referenced by the {loader_name} catalog are missing. "
+            "Cannot continue."
+        )
+
+def _find_default_checkpoint() -> Path | None:
+    """Try to find a checkpoint from the latest experiment directory."""
+
+    exp_dir = Path(os.environ.get("EXP_DIR", ".")).resolve()
+    ckpt_dir = exp_dir / "latest" / "checkpoints"
+    if not ckpt_dir.exists():
+        return None
+
+    for name in ("last.ckpt", "best.ckpt"):
+        candidate = ckpt_dir / name
+        if candidate.exists():
+            return candidate
+
+    ckpts = sorted(ckpt_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return ckpts[0] if ckpts else None
+
 
 def main():
     parser = _build_arg_parser()
@@ -165,9 +242,22 @@ def main():
     if "tfds" in args.dataloader and "TFDS_DATA_DIR" in os.environ:
         logging.info("Using TFDS dataset at %s", os.environ["TFDS_DATA_DIR"])
 
+    checkpoint_path = Path(args.checkpoint) if args.checkpoint else _find_default_checkpoint()
+    if not checkpoint_path or not checkpoint_path.exists():
+        raise RuntimeError(
+            "No checkpoint provided and no default checkpoint found. "
+            "Specify one with --checkpoint."
+        )
+    train_cfg = _load_training_config(checkpoint_path)
+
+    input_variables = train_cfg.get("input_variables", ALL_VARIABLES)
+    dataloader_kwargs_cfg = train_cfg.get("dataloader_kwargs", {})
     dataloader_kwargs = {
-        "tilt_last": args.tilt_last,
-        "select_keys": ALL_VARIABLES + ["range_folded_mask", "coordinates"],
+        "tilt_last": dataloader_kwargs_cfg.get("tilt_last", args.tilt_last),
+        "select_keys": train_cfg.get(
+            "dataloader_keys",
+            input_variables + ["range_folded_mask", "coordinates"],
+        ),
     }
     weights = None
 
@@ -180,28 +270,34 @@ def main():
         weights=weights,
         **dataloader_kwargs,
     )
+    _drop_missing_files(ds, "test")
     ds = _wrap_loader(ds)
 
     sample_batch = next(iter(ds))
-    input_shape, coord_shape = _infer_input_shapes(sample_batch, ALL_VARIABLES)
+    input_shape, coord_shape = _infer_input_shapes(sample_batch, input_variables)
     include_range_folded = args.include_range_folded or "range_folded_mask" in sample_batch
+
+    start_filters = int(train_cfg.get("start_filters", 48))
 
     likelihood = TornadoLikelihood(
         shape=input_shape,
         c_shape=coord_shape,
-        input_variables=ALL_VARIABLES,
+        input_variables=input_variables,
         include_range_folded=include_range_folded,
+        start_filters=start_filters,
     )
     classifier = TornadoClassifier(
         model=likelihood,
         metrics=_build_metrics(device),
     )
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    logging.info("Loading checkpoint: %s", checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
     classifier.load_state_dict(checkpoint["state_dict"])
     classifier.to(device)
     classifier.eval()
 
     metric_collection = _build_metrics(device)
+    stat_scores = BinaryStatScores(threshold=0.5).to(device)
     total_loss = 0.0
     total_count = 0
 
@@ -219,11 +315,17 @@ def main():
             loss = classifier.loss(logits, labels)
             total_loss += loss.item() * labels.shape[0]
             total_count += labels.shape[0]
-            metric_collection.update(torch.sigmoid(logits[:, 1]), labels)
+            probs = torch.sigmoid(logits[:, 1])
+            metric_collection.update(probs, labels)
+            stat_scores.update(probs, labels)
 
     metrics = metric_collection.compute()
+    tp, fp, tn, fn, _ = (s.item() for s in stat_scores.compute())
+    csi = _compute_csi(tp, fp, fn)
     avg_loss = total_loss / max(total_count, 1)
     metrics = {"Loss": avg_loss, **{k: float(v.cpu()) for k, v in metrics.items()}}
+    if csi is not None:
+        metrics["CSI"] = csi
     logging.info("Evaluation metrics: %s", metrics)
 
 
