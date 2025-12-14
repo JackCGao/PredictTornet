@@ -17,5 +17,5 @@
     "loss":"cce",
     "head":"maxpool",
     "exp_name":"tornado_baseline",
-    "dataloader":"keras"
+    "dataloader":"torch"
 }
