@@ -91,6 +91,24 @@ DEFAULT_CONFIG = {
 }
 
 
+def _load_default_config() -> Dict:
+    """
+    Load default config, preferring the JSON file if it exists so users can tweak
+    params without passing a path each time.
+    """
+
+    config = deepcopy(DEFAULT_CONFIG)
+    json_path = Path(__file__).with_name("config") / "params.json"
+    if json_path.exists():
+        try:
+            with open(json_path, "r") as f:
+                config.update(json.load(f))
+                logging.info("Loaded default config from %s", json_path)
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.warning("Failed to load %s: %s; falling back to DEFAULT_CONFIG", json_path, exc)
+    return config
+
+
 def _clone_dict(d: Dict | None) -> Dict:
     return deepcopy(d) if d else {}
 
@@ -359,7 +377,7 @@ def main(config: Dict):
 
 
 if __name__ == "__main__":
-    cfg = deepcopy(DEFAULT_CONFIG)
+    cfg = _load_default_config()
     if len(sys.argv) > 1:
         cfg.update(json.load(open(sys.argv[1], "r")))
     main(cfg)
