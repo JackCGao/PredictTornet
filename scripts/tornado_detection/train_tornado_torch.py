@@ -18,8 +18,9 @@ import os
 import shutil
 import sys
 from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import lightning as L
 import torch
@@ -60,6 +61,15 @@ if "TORNET_ROOT" not in os.environ:
     raise RuntimeError("Please set TORNET_ROOT to the dataset root before training.")
 DATA_ROOT = os.environ["TORNET_ROOT"]
 logging.info("TORNET_ROOT=%s", DATA_ROOT)
+
+# Optional plotting support; falls back gracefully if matplotlib is unavailable.
+try:  # pragma: no cover - optional dependency
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:  # pragma: no cover
+    plt = None
 
 DEFAULT_CONFIG = {
     "epochs": 10,
@@ -111,6 +121,69 @@ def _load_default_config() -> Dict:
 
 def _clone_dict(d: Dict | None) -> Dict:
     return deepcopy(d) if d else {}
+
+
+def _get_metric(metrics: Dict, keys: List[str]):
+    """Return the first matching key from metrics, or None."""
+
+    for key in keys:
+        if key in metrics:
+            return metrics[key]
+    return None
+
+
+@dataclass
+class PlotMetricsCallback(L.Callback):
+    """
+    Collect train/val loss and AUC per epoch and emit a summary plot at fit end.
+    """
+
+    out_path: Path
+    train_loss: List[float] = field(default_factory=list)
+    val_loss: List[float] = field(default_factory=list)
+    train_auc: List[float] = field(default_factory=list)
+    val_auc: List[float] = field(default_factory=list)
+
+    def on_train_epoch_end(self, trainer: L.Trainer, *_):
+        metrics = trainer.callback_metrics
+        loss = _get_metric(metrics, ["train_loss", "train_loss_epoch"])
+        auc = _get_metric(metrics, ["train_AUC", "train_AUC_epoch"])
+        self.train_loss.append(float(loss) if loss is not None else float("nan"))
+        self.train_auc.append(float(auc) if auc is not None else float("nan"))
+
+    def on_validation_epoch_end(self, trainer: L.Trainer, *_):
+        metrics = trainer.callback_metrics
+        loss = _get_metric(metrics, ["val_loss", "val_loss_epoch"])
+        auc = _get_metric(metrics, ["val_AUC", "val_AUC_epoch"])
+        self.val_loss.append(float(loss) if loss is not None else float("nan"))
+        self.val_auc.append(float(auc) if auc is not None else float("nan"))
+
+    def on_fit_end(self, trainer: L.Trainer, *_):
+        if plt is None:
+            logging.warning("matplotlib not available; skipping metric plot.")
+            return
+        epochs = list(range(1, max(len(self.train_loss), len(self.val_loss)) + 1))
+        fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+
+        ax[0].plot(epochs[: len(self.train_loss)], self.train_loss, label="train_loss")
+        ax[0].plot(epochs[: len(self.val_loss)], self.val_loss, label="val_loss")
+        ax[0].set_xlabel("Epoch")
+        ax[0].set_ylabel("Loss")
+        ax[0].legend()
+        ax[0].set_title("Loss")
+
+        ax[1].plot(epochs[: len(self.train_auc)], self.train_auc, label="train_AUC")
+        ax[1].plot(epochs[: len(self.val_auc)], self.val_auc, label="val_AUC")
+        ax[1].set_xlabel("Epoch")
+        ax[1].set_ylabel("AUC")
+        ax[1].legend()
+        ax[1].set_title("AUC")
+
+        fig.tight_layout()
+        self.out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(self.out_path)
+        plt.close(fig)
+        logging.info("Saved training curves to %s", self.out_path)
 
 
 def _to_float32(data):
@@ -332,6 +405,7 @@ def main(config: Dict):
     shutil.copy(__file__, os.path.join(expdir, "train.py"))
 
     tboard_dir, checkpoints_dir = make_callback_dirs(expdir)
+    plot_path = Path(expdir) / "training_curves.png"
     callbacks = [
         ModelCheckpoint(
             dirpath=checkpoints_dir,
@@ -342,6 +416,7 @@ def main(config: Dict):
             mode="min",
         ),
         LearningRateMonitor(logging_interval="epoch"),
+        PlotMetricsCallback(plot_path),
     ]
     tb_logger = TensorBoardLogger(save_dir=tboard_dir, name="torch")
     csv_logger = CSVLogger(save_dir=expdir, name="logs")

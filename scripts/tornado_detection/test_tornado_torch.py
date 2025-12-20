@@ -18,7 +18,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -272,6 +272,11 @@ def main():
     )
     _drop_missing_files(ds, "test")
     ds = _wrap_loader(ds)
+    dataset = getattr(ds, "dataset", None)
+    file_list: List[str] | None = getattr(dataset, "file_list", None)
+    can_catalog = file_list is not None and "tfds" not in args.dataloader
+    if not can_catalog:
+        logging.info("Per-sample cataloging disabled (no file_list available for this dataloader).")
 
     sample_batch = next(iter(ds))
     input_shape, coord_shape = _infer_input_shapes(sample_batch, input_variables)
@@ -300,6 +305,8 @@ def main():
     stat_scores = BinaryStatScores(threshold=0.5).to(device)
     total_loss = 0.0
     total_count = 0
+    false_catalog = {"false_positives": [], "false_negatives": []} if can_catalog else None
+    sample_index = 0
 
     with torch.no_grad():
         for batch in ds:
@@ -318,6 +325,26 @@ def main():
             probs = torch.sigmoid(logits[:, 1])
             metric_collection.update(probs, labels)
             stat_scores.update(probs, labels)
+            if false_catalog:
+                batch_size = labels.shape[0]
+                preds = (probs >= 0.5).long()
+                for i in range(batch_size):
+                    idx = sample_index + i
+                    if idx >= len(file_list):  # type: ignore[arg-type]
+                        continue
+                    path = file_list[idx]  # type: ignore[index]
+                    label = int(labels[i].cpu())
+                    pred = int(preds[i].cpu())
+                    prob = float(probs[i].cpu())
+                    if pred == 1 and label == 0:
+                        false_catalog["false_positives"].append(
+                            {"file": path, "prob": prob, "label": label, "pred": pred}
+                        )
+                    elif pred == 0 and label == 1:
+                        false_catalog["false_negatives"].append(
+                            {"file": path, "prob": prob, "label": label, "pred": pred}
+                        )
+                sample_index += batch_size
 
     metrics = metric_collection.compute()
     tp, fp, tn, fn, _ = (s.item() for s in stat_scores.compute())
@@ -327,6 +354,17 @@ def main():
     if csi is not None:
         metrics["CSI"] = csi
     logging.info("Evaluation metrics: %s", metrics)
+    if false_catalog:
+        out_dir = checkpoint_path.resolve().parent.parent
+        out_path = out_dir / "false_cases.json"
+        with open(out_path, "w") as f:
+            json.dump(false_catalog, f, indent=2)
+        logging.info(
+            "Cataloged %d false positives and %d false negatives to %s",
+            len(false_catalog["false_positives"]),
+            len(false_catalog["false_negatives"]),
+            out_path,
+        )
 
 
 if __name__ == "__main__":
