@@ -7,3 +7,6 @@ experiments/
 lightning_logs/
 tornado_baseline*
 tornet_baseline*
+tornet_baseline_torch*
+tornet_raw/
+*.nc
