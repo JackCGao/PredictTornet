@@ -138,6 +138,11 @@ def summarize_file(path: Path, variables: List[str], frames: int | None) -> Dict
                 "negative": int(np.sum(labels == 0)),
             }
 
+        meta = {
+            "ef_number": int(ds.attrs["ef_number"]) if "ef_number" in ds.attrs else None,
+            "category": ds.attrs.get("category"),
+        }
+
     return {
         "file": str(path),
         "grid": grid_shape,
@@ -147,6 +152,7 @@ def summarize_file(path: Path, variables: List[str], frames: int | None) -> Dict
         },
         "variables": var_summaries,
         "labels": label_summary,
+        "meta": meta,
     }
 
 
@@ -188,6 +194,13 @@ def main() -> None:
         print(
             f"Labels: total={lbl['total_frames']} positives={lbl['positive']} negatives={lbl['negative']}"
         )
+    meta = stats.get("meta") or {}
+    if meta:
+        ef_val = meta.get("ef_number")
+        cat_val = meta.get("category")
+        ef_str = str(ef_val) if ef_val is not None else "unknown"
+        cat_str = str(cat_val) if cat_val is not None else "unknown"
+        print(f"Meta: ef_number={ef_str} category={cat_str}")
 
     print("Variable stats:")
     for name, info in stats["variables"].items():

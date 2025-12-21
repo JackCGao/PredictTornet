@@ -87,11 +87,54 @@ def compute_coordinates(d,min_range_m=2125.0,
 
 def remove_time_dim(d):
     """
-    Removes time dimension from data by taking last available frame
+    Removes the time dimension by selecting a random frame.
     """
-    for v in d:
-        d[v] = d[v][0]
+    def _random_index(t):
+        # Choose backend-specific random index for reproducibility within each framework
+        try:
+            import tensorflow as tf
+            if isinstance(t, tf.Tensor):
+                return tf.random.uniform(shape=(), minval=0, maxval=tf.shape(t)[0], dtype=tf.int32)
+        except ImportError:
+            pass
+
+        try:
+            import torch
+            if isinstance(t, torch.Tensor):
+                return torch.randint(t.shape[0], (), device=t.device)
+        except ImportError:
+            pass
+
+        return np.random.randint(0, t.shape[0])
+
+    def _take_at_index(arr, idx):
+        try:
+            import tensorflow as tf
+            if isinstance(arr, tf.Tensor):
+                return arr[idx]
+        except ImportError:
+            pass
+
+        try:
+            import torch
+            if isinstance(arr, torch.Tensor):
+                return arr[idx]
+        except ImportError:
+            pass
+
+        return arr[idx]
+
+    time_arr = d.get('time')
+    if time_arr is None:
+        return d
+
+    idx = _random_index(time_arr)
+    keys_with_time = set(ALL_VARIABLES + ['range_folded_mask', 'label', 'time'])
+    for k, v in d.items():
+        if k in keys_with_time and hasattr(v, 'shape') and len(v.shape) > 0:
+            d[k] = _take_at_index(v, idx)
     return d
+
 
 def add_batch_dim(data: Dict[str,np.ndarray]):
     """
