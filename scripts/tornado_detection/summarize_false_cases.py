@@ -13,12 +13,11 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from typing import Dict, Tuple
 
 import xarray as xr
-
 
 def _resolve_path(raw_path: str, base: Path | None) -> Path | None:
     """
@@ -42,6 +41,7 @@ def _summarize(cases, base: Path | None, label: str):
     cat_counts: Counter[str] = Counter()
     combo_counts: Counter[Tuple[str, int]] = Counter()
     missing: Dict[str, str] = {}
+    probs = []
 
     for entry in cases:
         raw_path = entry.get("file", "")
@@ -58,6 +58,13 @@ def _summarize(cases, base: Path | None, label: str):
             missing[raw_path] = f"read error: {exc}"
             continue
 
+        prob = entry.get("prob")
+        if prob is not None:
+            try:
+                probs.append(float(prob))
+            except Exception:
+                pass
+
         ef_counts[ef] += 1
         cat_counts[cat] += 1
         combo_counts[(cat, ef)] += 1
@@ -65,6 +72,10 @@ def _summarize(cases, base: Path | None, label: str):
     total = sum(ef_counts.values())
     print(f"\n== {label} summary ==")
     print(f"Total {label.lower()}: {total}")
+    if probs:
+        avg = sum(probs) / len(probs)
+        print(f"Average predicted probability: {avg:.4f} (n={len(probs)})")
+
     if missing:
         print(f"Missing/failed files: {len(missing)} (showing up to 5)")
         for k, v in list(missing.items())[:5]:
@@ -94,18 +105,21 @@ def main() -> None:
         "json_path",
         type=Path,
         nargs="?",
-        default=Path("/home/bgao/PredictTornet/tornado_baseline251221231516-None-None/false_cases.json"),
+        default=Path("/Users/jackgao/Documents/TornadoSight/PredictTornet/PredictTornet/tornado_baseline251221231516-None-None/false_cases.json"),
         help="Path to false_cases.json (default: %(default)s)",
     )
     parser.add_argument(
         "--base",
         type=Path,
-        default=None,
-        help="Base path to rebuild file paths if JSON paths do not exist locally.",
+        default=Path(__file__).resolve().parents[2],
+        help="Base path to rebuild file paths if JSON paths do not exist locally (default: project root).",
     )
     args = parser.parse_args()
 
-    data = json.loads(Path(args.json_path).read_text())
+    if not args.json_path.exists():
+        raise SystemExit(f"JSON file not found: {args.json_path}. Please provide a valid path.")
+
+    data = json.loads(args.json_path.read_text())
     false_negs = data.get("false_negatives", [])
     false_pos = data.get("false_positives", [])
     if not false_negs and not false_pos:
