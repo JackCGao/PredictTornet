@@ -14,6 +14,25 @@ import numpy as np
 from tornet.data.constants import ALL_VARIABLES
 
 
+def _scalar(value, backend=np):
+    """Convert a value to a backend scalar (0-D)."""
+    try:
+        import torch
+        if backend is torch:
+            return torch.as_tensor(value).reshape(())
+    except Exception:
+        pass
+
+    try:
+        import tensorflow as tf
+        if backend is tf:
+            return tf.reshape(tf.convert_to_tensor(value), ())
+    except Exception:
+        pass
+
+    return np.array(value).reshape(())
+
+
 def get_shape(d):
     """
     infers image shape from data in dict d
@@ -57,14 +76,14 @@ def compute_coordinates(d,min_range_m=2125.0,
     # "250" is the resolution of NEXRAD
     # "1e-5" is scaling applied for normalization
     SCALE = 1e-5 # used to scale range field for CNN
-    rng_lower = (d['rng_lower']+250) * SCALE # [1,]
-    rng_upper = (d['rng_upper']-250) * SCALE # [1,]
+    rng_lower = ( _scalar(d['rng_lower'], backend) + 250) * SCALE # [1,]
+    rng_upper = ( _scalar(d['rng_upper'], backend) - 250) * SCALE # [1,]
     min_range_m *= SCALE
     
     # Get az range,  convert to math convention where 0 deg is x-axis
-    az_lower = d['az_lower']
+    az_lower = _scalar(d['az_lower'], backend)
     az_lower = (90-az_lower) * np.pi/180 # [1,]
-    az_upper = d['az_upper']
+    az_upper = _scalar(d['az_upper'], backend)
     az_upper = (90-az_upper) * np.pi/180 # [1,]
     
     # create mesh grids 
@@ -87,25 +106,35 @@ def compute_coordinates(d,min_range_m=2125.0,
 
 def remove_time_dim(d):
     """
-    Removes the time dimension by selecting a random frame.
+    Removes the time dimension by selecting a random frame within the time range.
     """
-    def _random_index(t):
-        # Choose backend-specific random index for reproducibility within each framework
+    def _random_time_index(t):
+        # Choose a random time within [min, max] and select the nearest frame index.
         try:
             import tensorflow as tf
             if isinstance(t, tf.Tensor):
-                return tf.random.uniform(shape=(), minval=0, maxval=tf.shape(t)[0], dtype=tf.int32)
+                t_float = tf.cast(t, tf.float32)
+                t_min = tf.reduce_min(t_float)
+                t_max = tf.reduce_max(t_float)
+                sample = tf.random.uniform(shape=(), minval=t_min, maxval=t_max, dtype=tf.float32)
+                return tf.argmin(tf.abs(t_float - sample), axis=0)
         except ImportError:
             pass
 
         try:
             import torch
             if isinstance(t, torch.Tensor):
-                return torch.randint(t.shape[0], (), device=t.device)
+                t_float = t.to(dtype=torch.float32)
+                t_min = torch.min(t_float)
+                t_max = torch.max(t_float)
+                sample = torch.empty((), device=t.device, dtype=torch.float32).uniform_(float(t_min), float(t_max))
+                return torch.argmin(torch.abs(t_float - sample))
         except ImportError:
             pass
 
-        return np.random.randint(0, t.shape[0])
+        t_np = np.asarray(t, dtype=float)
+        sample = np.random.uniform(t_np.min(), t_np.max())
+        return int(np.abs(t_np - sample).argmin())
 
     def _take_at_index(arr, idx):
         try:
@@ -128,11 +157,30 @@ def remove_time_dim(d):
     if time_arr is None:
         return d
 
-    idx = _random_index(time_arr)
+    idx = _random_time_index(time_arr)
     keys_with_time = set(ALL_VARIABLES + ['range_folded_mask', 'label', 'time'])
     for k, v in d.items():
         if k in keys_with_time and hasattr(v, 'shape') and len(v.shape) > 0:
-            d[k] = _take_at_index(v, idx)
+            sliced = _take_at_index(v, idx)
+            try:
+                import tensorflow as tf
+                if isinstance(sliced, tf.Tensor):
+                    sliced = tf.squeeze(sliced)
+            except ImportError:
+                pass
+            try:
+                import torch
+                if isinstance(sliced, torch.Tensor):
+                    sliced = torch.squeeze(sliced)
+            except ImportError:
+                pass
+            if hasattr(sliced, "shape"):
+                try:
+                    import numpy as _np
+                    sliced = _np.squeeze(sliced)
+                except Exception:
+                    pass
+            d[k] = sliced
     return d
 
 

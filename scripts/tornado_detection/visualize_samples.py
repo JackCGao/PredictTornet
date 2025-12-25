@@ -8,6 +8,8 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
+import os
 from pathlib import Path
 from typing import List, Sequence
 
@@ -98,9 +100,55 @@ def plot_file(path: Path, variables: Sequence[str], frame_idx: int, tilt_index: 
         plt.close(fig)
 
 
+def _safe_relpath(path: Path, root: Path | None) -> Path:
+    if root is None:
+        return Path(path.name)
+    try:
+        return path.resolve().relative_to(root.resolve())
+    except Exception:
+        return Path(path.name)
+
+
+def plot_false_cases(
+    false_cases_json: Path,
+    out_dir: Path,
+    variables: Sequence[str],
+    frame_idx: int,
+    tilt_index: int | None,
+    data_root: Path | None,
+):
+    with false_cases_json.open("r") as f:
+        data = json.load(f)
+    for key in ["false_positives", "false_negatives"]:
+        cases = data.get(key, [])
+        if not cases:
+            continue
+        for entry in cases:
+            file_path = Path(entry["file"])
+            rel = _safe_relpath(file_path, data_root)
+            save_path = out_dir / key / rel.with_suffix(".png")
+            try:
+                plot_file(file_path, variables, frame_idx, tilt_index, save_path)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Failed to plot {file_path}: {exc}")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Visualize TorNet variables for a single NetCDF sample.")
-    parser.add_argument("file", type=Path, help="Path to a .nc file")
+    parser = argparse.ArgumentParser(
+        description="Visualize TorNet variables for a single NetCDF sample or cataloged false cases.",
+    )
+    parser.add_argument("file", type=Path, nargs="?", help="Path to a .nc file")
+    parser.add_argument(
+        "--false-cases",
+        type=Path,
+        help="Path to false_cases.json (from test_tornado_torch.py) to batch-plot false positives/negatives.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("false_case_plots"),
+        help="Output directory for batch plotting false cases (default: false_case_plots).",
+    )
     parser.add_argument(
         "--variables",
         nargs="*",
@@ -127,7 +175,20 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    plot_file(args.file, args.variables, args.frame, args.tilt_index, args.save)
+    if args.false_cases:
+        data_root = Path(os.environ["TORNET_ROOT"]).resolve() if "TORNET_ROOT" in os.environ else None
+        plot_false_cases(
+            false_cases_json=args.false_cases,
+            out_dir=args.output_dir,
+            variables=args.variables,
+            frame_idx=args.frame,
+            tilt_index=args.tilt_index,
+            data_root=data_root,
+        )
+    elif args.file:
+        plot_file(args.file, args.variables, args.frame, args.tilt_index, args.save)
+    else:
+        parser.error("Either provide a file to plot or --false-cases for batch plotting.")
 
 if __name__ == "__main__":
     main()
