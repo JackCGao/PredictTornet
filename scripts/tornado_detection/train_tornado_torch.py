@@ -87,6 +87,8 @@ DEFAULT_CONFIG = {
     "l2_reg": 1e-5,
     "kernel_size": 3,
     "n_blocks": 4,
+    "convs_per_block": [2, 2, 3, 3],
+    "drop_rate": 0.1,
     "wN": 1.0,
     "w0": 1.0,
     "w1": 1.0,
@@ -136,7 +138,7 @@ def _suggest_config(trial, base_config: Dict) -> Dict:
     if "start_filters" in cfg:
         cfg["start_filters"] = trial.suggest_categorical("start_filters", [32, 48, 64, 80])
     if "learning_rate" in cfg:
-        cfg["learning_rate"] = trial.suggest_float("learning_rate", 5e-5, 5e-4, log=True)
+        cfg["learning_rate"] = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
     if "decay_steps" in cfg:
         cfg["decay_steps"] = trial.suggest_int("decay_steps", 500, 2500)
     if "decay_rate" in cfg:
@@ -163,6 +165,15 @@ def _suggest_config(trial, base_config: Dict) -> Dict:
         cfg["kernel_size"] = trial.suggest_categorical("kernel_size", [3, 5])
     if "n_blocks" in cfg:
         cfg["n_blocks"] = trial.suggest_int("n_blocks", 2, 4)
+    if "convs_per_block" in cfg:
+        cfg["convs_per_block"] = [
+            trial.suggest_int("convs_block1", 1, 3),
+            trial.suggest_int("convs_block2", 1, 3),
+            trial.suggest_int("convs_block3", 2, 4),
+            trial.suggest_int("convs_block4", 2, 4),
+        ]
+    if "drop_rate" in cfg:
+        cfg["drop_rate"] = trial.suggest_float("drop_rate", 0.1, 0.4)
     return cfg
 
 
@@ -426,6 +437,8 @@ def main(config: Dict):
         include_range_folded=include_range_folded,
         kernel_size=config.get("kernel_size", 3),
         n_blocks=config.get("n_blocks", 4),
+        convs_per_block=config.get("convs_per_block"),
+        drop_rate=config.get("drop_rate", 0.1),
     )
     metrics = _build_metrics()
     classifier = TornadoClassifier(

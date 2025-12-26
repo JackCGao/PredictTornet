@@ -131,7 +131,8 @@ class TornadoLikelihood(nn.Module):
                         include_range_folded:bool=True,
                         kernel_size:int=3,
                         n_blocks:int=4,
-                        convs_per_block:List[int]=None):
+                        convs_per_block:List[int]=None,
+                        drop_rate:float=0.1):
         super(TornadoLikelihood, self).__init__()
         self.input_shape=shape
         self.n_sweeps=shape[0]
@@ -142,6 +143,7 @@ class TornadoLikelihood(nn.Module):
         self.include_range_folded=include_range_folded
         self.kernel_size = kernel_size
         self.n_blocks = max(1, min(n_blocks, 4))  # clamp between 1 and 4
+        self.drop_rate = drop_rate
         
         # Set up normalizers
         self.input_norm_layers = {}
@@ -170,7 +172,7 @@ class TornadoLikelihood(nn.Module):
                 filters,
                 kernel_size=self.kernel_size,
                 n_convs=n_convs_block,
-                drop_rate=0.1,
+                drop_rate=self.drop_rate,
             )
             blocks.append(blk)
             last_channels = filters
