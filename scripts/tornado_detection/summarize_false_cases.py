@@ -105,7 +105,7 @@ def main() -> None:
         "json_path",
         type=Path,
         nargs="?",
-        default=Path("/Users/jackgao/Documents/TornadoSight/PredictTornet/PredictTornet/tornado_baseline251221231516-None-None/false_cases.json"),
+        default=Path("/home/bgao/PredictTornet/tornado_baseline251221231516-None-None/false_cases.json"),
         help="Path to false_cases.json (default: %(default)s)",
     )
     parser.add_argument(
