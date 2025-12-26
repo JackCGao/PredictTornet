@@ -12,6 +12,7 @@ Delivered to the U.S. Government with Unlimited Rights, as defined in DFARS Part
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -46,6 +47,7 @@ from tornet.data.constants import ALL_VARIABLES
 from tornet.data.loader import get_dataloader
 from tornet.models.torch.cnn_baseline import TornadoClassifier, TornadoLikelihood
 from tornet.utils.general import make_callback_dirs, make_exp_dir
+import numpy as np  # used only for optuna logging
 
 logging.basicConfig(level=logging.INFO)
 
@@ -83,6 +85,8 @@ DEFAULT_CONFIG = {
     "decay_steps": 1386,
     "decay_rate": 0.958,
     "l2_reg": 1e-5,
+    "kernel_size": 3,
+    "n_blocks": 4,
     "wN": 1.0,
     "w0": 1.0,
     "w1": 1.0,
@@ -117,6 +121,49 @@ def _load_default_config() -> Dict:
         except Exception as exc:  # pragma: no cover - defensive
             logging.warning("Failed to load %s: %s; falling back to DEFAULT_CONFIG", json_path, exc)
     return config
+
+
+def _suggest_config(trial, base_config: Dict) -> Dict:
+    """
+    Suggest hyperparameters for Optuna search based on keys present in the config.
+    Only parameters found in params.json/defaults are sampled.
+    """
+    cfg = deepcopy(base_config)
+    if "epochs" in cfg:
+        cfg["epochs"] = trial.suggest_int("epochs", 5, 15)
+    if "batch_size" in cfg:
+        cfg["batch_size"] = trial.suggest_categorical("batch_size", [64, 96, 128, 192, 256])
+    if "start_filters" in cfg:
+        cfg["start_filters"] = trial.suggest_categorical("start_filters", [32, 48, 64, 80])
+    if "learning_rate" in cfg:
+        cfg["learning_rate"] = trial.suggest_float("learning_rate", 5e-5, 5e-4, log=True)
+    if "decay_steps" in cfg:
+        cfg["decay_steps"] = trial.suggest_int("decay_steps", 500, 2500)
+    if "decay_rate" in cfg:
+        cfg["decay_rate"] = trial.suggest_float("decay_rate", 0.90, 0.999)
+    if "l2_reg" in cfg:
+        cfg["l2_reg"] = trial.suggest_float("l2_reg", 1e-6, 1e-3, log=True)
+    if "wN" in cfg:
+        cfg["wN"] = trial.suggest_float("wN", 0.3, 2.5)
+    if "w0" in cfg:
+        cfg["w0"] = trial.suggest_float("w0", 0.8, 3.0)
+    if "w1" in cfg:
+        cfg["w1"] = trial.suggest_float("w1", 0.8, 3.0)
+    if "w2" in cfg:
+        cfg["w2"] = trial.suggest_float("w2", 1.0, 4.0)
+    if "wW" in cfg:
+        cfg["wW"] = trial.suggest_float("wW", 0.3, 2.0)
+    if "label_smooth" in cfg:
+        cfg["label_smooth"] = trial.suggest_float("label_smooth", 0.0, 0.1)
+    if "head" in cfg:
+        cfg["head"] = trial.suggest_categorical("head", ["maxpool", "avgpool"])
+    if "loss" in cfg:
+        cfg["loss"] = trial.suggest_categorical("loss", ["cce", "bce"])
+    if "kernel_size" in cfg:
+        cfg["kernel_size"] = trial.suggest_categorical("kernel_size", [3, 5])
+    if "n_blocks" in cfg:
+        cfg["n_blocks"] = trial.suggest_int("n_blocks", 2, 4)
+    return cfg
 
 
 def _clone_dict(d: Dict | None) -> Dict:
@@ -377,6 +424,8 @@ def main(config: Dict):
         input_variables=input_variables,
         start_filters=start_filters,
         include_range_folded=include_range_folded,
+        kernel_size=config.get("kernel_size", 3),
+        n_blocks=config.get("n_blocks", 4),
     )
     metrics = _build_metrics()
     classifier = TornadoClassifier(
@@ -451,8 +500,81 @@ def main(config: Dict):
     return {"AUC": best_auc, "AUCPR": best_aucpr, "CSI": best_csi}
 
 
+def run_optuna(base_config: Dict, n_trials: int = 10, save_path: Path | None = None):
+    try:
+        import optuna
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise SystemExit("optuna is required for tuning. Install with `pip install optuna`.") from exc
+
+    def objective(trial):
+        cfg = _suggest_config(trial, base_config)
+        cfg["exp_name"] = f"{base_config.get('exp_name', 'tune')}_trial{trial.number}"
+        result = main(cfg)
+        auc = float(result.get("AUC", 0.0) or 0.0)
+        trial.set_user_attr("AUCPR", float(result.get("AUCPR", 0.0) or 0.0))
+        trial.set_user_attr("CSI", float(result.get("CSI", 0.0) or 0.0))
+        return auc
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials)
+
+    best = study.best_trial
+    logging.info("Best trial: %s AUC=%.4f", best.number, best.value)
+    logging.info("User attrs: %s", best.user_attrs)
+    logging.info("Params: %s", best.params)
+    print("\nOptuna best AUC: %.4f" % best.value)
+    print("Best params:")
+    for k, v in sorted(best.params.items()):
+        print(f"  {k}: {v}")
+    print("Additional metrics:", best.user_attrs)
+
+    # Persist best hyperparameters to params.json (or provided path)
+    if save_path is None:
+        save_path = Path(__file__).with_name("config") / "params.json"
+    best_config = deepcopy(base_config)
+    best_config.update(best.params)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(save_path, "w") as f:
+        json.dump(best_config, f, indent=4)
+    logging.info("Wrote best params to %s", save_path)
+    return study
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train TorNet baseline (Torch) with optional Optuna tuning.")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to JSON config override (e.g., params.json). Defaults to embedded + config/params.json if present.",
+    )
+    parser.add_argument(
+        "--tune",
+        action="store_true",
+        help="Run Optuna hyperparameter search instead of a single training run.",
+    )
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=10,
+        help="Number of Optuna trials to run when --tune is set (default: 10).",
+    )
+    parser.add_argument(
+        "--save-params",
+        type=Path,
+        default=None,
+        help="Where to save best hyperparameters when tuning (default: overwrite config/params.json).",
+    )
+    args = parser.parse_args()
+
     cfg = _load_default_config()
-    if len(sys.argv) > 1:
-        cfg.update(json.load(open(sys.argv[1], "r")))
-    main(cfg)
+    if args.config:
+        try:
+            cfg.update(json.loads(Path(args.config).read_text()))
+        except Exception as exc:
+            raise SystemExit(f"Failed to load config {args.config}: {exc}") from exc
+
+    if args.tune:
+        run_optuna(cfg, n_trials=args.trials, save_path=args.save_params)
+    else:
+        main(cfg)

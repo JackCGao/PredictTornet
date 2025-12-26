@@ -128,7 +128,10 @@ class TornadoLikelihood(nn.Module):
                         input_variables:List[str]=ALL_VARIABLES,
                         start_filters:int=64,
                         background_flag:float=-3.0,
-                        include_range_folded:bool=True):
+                        include_range_folded:bool=True,
+                        kernel_size:int=3,
+                        n_blocks:int=4,
+                        convs_per_block:List[int]=None):
         super(TornadoLikelihood, self).__init__()
         self.input_shape=shape
         self.n_sweeps=shape[0]
@@ -137,6 +140,8 @@ class TornadoLikelihood(nn.Module):
         self.start_filters=start_filters
         self.background_flag=background_flag
         self.include_range_folded=include_range_folded
+        self.kernel_size = kernel_size
+        self.n_blocks = max(1, min(n_blocks, 4))  # clamp between 1 and 4
         
         # Set up normalizers
         self.input_norm_layers = {}
@@ -149,16 +154,35 @@ class TornadoLikelihood(nn.Module):
         # Processing blocks
         in_channels = (len(input_variables)+int(self.include_range_folded))*self.n_sweeps
         in_coords=self.c_shape[0]
-        self.blk1 = VggBlock(in_channels,in_coords,start_filters,   kernel_size=3,  n_convs=2, drop_rate=0.1)   # (60,120)
-        self.blk2 = VggBlock(start_filters,in_coords,2*start_filters, kernel_size=3,  n_convs=2, drop_rate=0.1)  # (30,60)
-        self.blk3 = VggBlock(2*start_filters,in_coords,4*start_filters, kernel_size=3,  n_convs=3, drop_rate=0.1)  # (15,30)
-        self.blk4 = VggBlock(4*start_filters,in_coords,8*start_filters, kernel_size=3,  n_convs=3, drop_rate=0.1)  # (7,15)
+        default_convs = [2, 2, 3, 3]
+        if convs_per_block is None:
+            convs_per_block = default_convs
+        convs_per_block = (convs_per_block + default_convs)[:4]  # ensure length>=4
+
+        blocks = []
+        last_channels = in_channels
+        filters = start_filters
+        for idx in range(self.n_blocks):
+            n_convs_block = convs_per_block[idx]
+            blk = VggBlock(
+                last_channels,
+                in_coords,
+                filters,
+                kernel_size=self.kernel_size,
+                n_convs=n_convs_block,
+                drop_rate=0.1,
+            )
+            blocks.append(blk)
+            last_channels = filters
+            filters *= 2
+        self.blocks = nn.ModuleList(blocks)
         
+        head_in_channels = last_channels
         self.head = nn.Sequential(
-            nn.Conv2d(in_channels=8*start_filters, out_channels=512, kernel_size=(1,1)),
-             nn.ReLU(),
-             nn.Conv2d(in_channels=512, out_channels=256, kernel_size=(1,1)),
-             nn.ReLU()
+            nn.Conv2d(in_channels=head_in_channels, out_channels=512, kernel_size=(1,1)),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=512, out_channels=256, kernel_size=(1,1)),
+            nn.ReLU()
         )
         self.conv_out = nn.Conv2d(in_channels=256, out_channels=1, kernel_size=(1,1))
         
@@ -192,10 +216,8 @@ class TornadoLikelihood(nn.Module):
             x = torch.cat((x,data['range_folded_mask']),axis=1)
         
         # process
-        x,c=self.blk1((x,c))
-        x,c=self.blk2((x,c))
-        x,c=self.blk3((x,c))
-        x,c=self.blk4((x,c))
+        for blk in self.blocks:
+            x, c = blk((x, c))
         x = self.head(x)
 
         # output single channel heatmap for likelihood field

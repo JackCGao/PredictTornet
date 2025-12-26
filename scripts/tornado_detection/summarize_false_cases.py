@@ -51,7 +51,7 @@ def _summarize(cases, base: Path | None, label: str):
             continue
 
         try:
-            with xr.open_dataset(resolved) as ds:
+            with xr.open_dataset(resolved) as ds: 
                 ef = int(ds.attrs.get("ef_number", -1))
                 cat = str(ds.attrs.get("category", "UNK"))
         except Exception as exc:
