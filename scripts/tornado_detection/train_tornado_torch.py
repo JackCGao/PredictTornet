@@ -627,9 +627,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--objective",
         type=str,
-        default="auc",
+        default="multi",
         choices=["auc", "csi", "aucpr", "multi"],
-        help="Metric to optimize when tuning (default: auc). Use 'multi' to maximize AUC, AUCPR, and CSI together.",
+        help="Metric to optimize when tuning (default: multi for AUC, AUCPR, CSI together).",
     )
     parser.add_argument(
         "--study-name",
