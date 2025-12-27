@@ -449,6 +449,7 @@ def main(config: Dict):
         label_smoothing=label_smooth,
         weight_decay=l2_reg,
         metrics=metrics,
+        loss_type=config.get("loss", "cce"),
     )
 
     expdir = make_exp_dir(exp_dir=exp_dir, prefix=exp_name)
@@ -513,29 +514,74 @@ def main(config: Dict):
     return {"AUC": best_auc, "AUCPR": best_aucpr, "CSI": best_csi}
 
 
-def run_optuna(base_config: Dict, n_trials: int = 10, save_path: Path | None = None):
+def run_optuna(
+    base_config: Dict,
+    n_trials: int = 10,
+    save_path: Path | None = None,
+    objective_metric: str = "auc",
+    study_name: str = "tornet_optuna",
+    storage: str | None = "sqlite:///tornet_optuna.db",
+):
     try:
         import optuna
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise SystemExit("optuna is required for tuning. Install with `pip install optuna`.") from exc
 
-    def objective(trial):
+    metric_key = objective_metric.upper()
+    valid_metrics = {"AUC", "CSI", "AUCPR", "MULTI"}
+    if metric_key not in valid_metrics:
+        raise SystemExit(f"Invalid objective '{objective_metric}'. Choose from {sorted(valid_metrics)}.")
+
+    def objective_single(trial):
         cfg = _suggest_config(trial, base_config)
         cfg["exp_name"] = f"{base_config.get('exp_name', 'tune')}_trial{trial.number}"
         result = main(cfg)
         auc = float(result.get("AUC", 0.0) or 0.0)
-        trial.set_user_attr("AUCPR", float(result.get("AUCPR", 0.0) or 0.0))
-        trial.set_user_attr("CSI", float(result.get("CSI", 0.0) or 0.0))
-        return auc
+        aucpr = float(result.get("AUCPR", 0.0) or 0.0)
+        csi = float(result.get("CSI", 0.0) or 0.0)
+        trial.set_user_attr("AUCPR", aucpr)
+        trial.set_user_attr("CSI", csi)
+        target = {"AUC": auc, "AUCPR": aucpr, "CSI": csi}[metric_key]
+        return target
 
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=n_trials)
+    def objective_multi(trial):
+        cfg = _suggest_config(trial, base_config)
+        cfg["exp_name"] = f"{base_config.get('exp_name', 'tune')}_trial{trial.number}"
+        result = main(cfg)
+        auc = float(result.get("AUC", 0.0) or 0.0)
+        aucpr = float(result.get("AUCPR", 0.0) or 0.0)
+        csi = float(result.get("CSI", 0.0) or 0.0)
+        trial.set_user_attr("AUC", auc)
+        trial.set_user_attr("AUCPR", aucpr)
+        trial.set_user_attr("CSI", csi)
+        return auc, aucpr, csi
 
-    best = study.best_trial
-    logging.info("Best trial: %s AUC=%.4f", best.number, best.value)
+    if metric_key == "MULTI":
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=storage,
+            load_if_exists=True,
+            directions=["maximize", "maximize", "maximize"],
+        )
+        study.optimize(objective_multi, n_trials=n_trials)
+        # pick a representative best trial (highest AUC among Pareto front)
+        best = max(study.best_trials, key=lambda t: t.values[0])
+        best_value = best.values
+    else:
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=storage,
+            load_if_exists=True,
+            direction="maximize",
+        )
+        study.optimize(objective_single, n_trials=n_trials)
+        best = study.best_trial
+        best_value = best.value
+
+    logging.info("Best trial: %s values=%s", best.number, best_value)
     logging.info("User attrs: %s", best.user_attrs)
     logging.info("Params: %s", best.params)
-    print("\nOptuna best AUC: %.4f" % best.value)
+    print("\nOptuna best values:", best_value)
     print("Best params:")
     for k, v in sorted(best.params.items()):
         print(f"  {k}: {v}")
@@ -578,6 +624,25 @@ if __name__ == "__main__":
         default=None,
         help="Where to save best hyperparameters when tuning (default: overwrite config/params.json).",
     )
+    parser.add_argument(
+        "--objective",
+        type=str,
+        default="multi",
+        choices=["auc", "csi", "aucpr", "multi"],
+        help="Metric to optimize when tuning (default: multi for AUC, AUCPR, CSI together).",
+    )
+    parser.add_argument(
+        "--study-name",
+        type=str,
+        default="tornet_optuna",
+        help="Optuna study name for persistent tuning (default: tornet_optuna).",
+    )
+    parser.add_argument(
+        "--storage",
+        type=str,
+        default="sqlite:///tornet_optuna.db",
+        help="Optuna storage URL for persistent tuning (default: sqlite:///tornet_optuna.db).",
+    )
     args = parser.parse_args()
 
     cfg = _load_default_config()
@@ -588,6 +653,13 @@ if __name__ == "__main__":
             raise SystemExit(f"Failed to load config {args.config}: {exc}") from exc
 
     if args.tune:
-        run_optuna(cfg, n_trials=args.trials, save_path=args.save_params)
+        run_optuna(
+            cfg,
+            n_trials=args.trials,
+            save_path=args.save_params,
+            objective_metric=args.objective,
+            study_name=args.study_name,
+            storage=args.storage,
+        )
     else:
         main(cfg)
