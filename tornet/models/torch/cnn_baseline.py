@@ -35,7 +35,8 @@ class TornadoClassifier(L.LightningModule):
                       lr_decay_steps=1,
                       label_smoothing:float=0.2,
                       weight_decay:float=0.001,
-                      metrics:MetricCollection=None):
+                      metrics:MetricCollection=None,
+                      loss_type:str="cce"):
         super().__init__()
         self.model=model
         self.lr=lr
@@ -43,7 +44,12 @@ class TornadoClassifier(L.LightningModule):
         self.weight_decay=weight_decay
         self.lr_decay_rate=lr_decay_rate
         self.lr_decay_steps=lr_decay_steps
-        self.loss = nn.CrossEntropyLoss(label_smoothing=0.2)
+        self.loss_type = loss_type.lower()
+        if self.loss_type == "bce":
+            self.loss = nn.BCEWithLogitsLoss()
+        else:
+            self.loss_type = "cce"
+            self.loss = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
 
         if metrics:
             self.train_metrics = metrics.clone(prefix='train_')
@@ -61,7 +67,10 @@ class TornadoClassifier(L.LightningModule):
         logits = F.max_pool2d(logits, kernel_size=logits.size()[2:]) # [batch,1,1,1] 
         logits = torch.cat( (-logits,logits),axis=1)  # [batch,2,1,1] 
         logits = torch.squeeze(logits) # [batch,2] for binary classification
-        loss = self.loss(logits, y)
+        if self.loss_type == "bce":
+            loss = self.loss(logits[:,1], y.float())
+        else:
+            loss = self.loss(logits, y)
         
         # Logging..
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -94,7 +103,10 @@ class TornadoClassifier(L.LightningModule):
         logits = F.max_pool2d(logits, kernel_size=logits.size()[2:]) # [batch,1,1,1] 
         logits = torch.cat( (-logits,logits),axis=1)  # [batch,2,1,1] 
         logits = torch.squeeze(logits) # [batch,2] for binary classification
-        loss = self.loss(logits, y)
+        if self.loss_type == "bce":
+            loss = self.loss(logits[:,1], y.float())
+        else:
+            loss = self.loss(logits, y)
         return y,logits,loss
     
     def _log_metrics(self,metrics,y,logits):
