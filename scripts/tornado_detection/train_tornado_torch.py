@@ -514,7 +514,14 @@ def main(config: Dict):
     return {"AUC": best_auc, "AUCPR": best_aucpr, "CSI": best_csi}
 
 
-def run_optuna(base_config: Dict, n_trials: int = 10, save_path: Path | None = None, objective_metric: str = "auc"):
+def run_optuna(
+    base_config: Dict,
+    n_trials: int = 10,
+    save_path: Path | None = None,
+    objective_metric: str = "auc",
+    study_name: str = "tornet_optuna",
+    storage: str | None = "sqlite:///tornet_optuna.db",
+):
     try:
         import optuna
     except ImportError as exc:  # pragma: no cover - optional dependency
@@ -550,13 +557,23 @@ def run_optuna(base_config: Dict, n_trials: int = 10, save_path: Path | None = N
         return auc, aucpr, csi
 
     if metric_key == "MULTI":
-        study = optuna.create_study(directions=["maximize", "maximize", "maximize"])
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=storage,
+            load_if_exists=True,
+            directions=["maximize", "maximize", "maximize"],
+        )
         study.optimize(objective_multi, n_trials=n_trials)
         # pick a representative best trial (highest AUC among Pareto front)
         best = max(study.best_trials, key=lambda t: t.values[0])
         best_value = best.values
     else:
-        study = optuna.create_study(direction="maximize")
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=storage,
+            load_if_exists=True,
+            direction="maximize",
+        )
         study.optimize(objective_single, n_trials=n_trials)
         best = study.best_trial
         best_value = best.value
@@ -614,6 +631,18 @@ if __name__ == "__main__":
         choices=["auc", "csi", "aucpr", "multi"],
         help="Metric to optimize when tuning (default: auc). Use 'multi' to maximize AUC, AUCPR, and CSI together.",
     )
+    parser.add_argument(
+        "--study-name",
+        type=str,
+        default="tornet_optuna",
+        help="Optuna study name for persistent tuning (default: tornet_optuna).",
+    )
+    parser.add_argument(
+        "--storage",
+        type=str,
+        default="sqlite:///tornet_optuna.db",
+        help="Optuna storage URL for persistent tuning (default: sqlite:///tornet_optuna.db).",
+    )
     args = parser.parse_args()
 
     cfg = _load_default_config()
@@ -624,6 +653,13 @@ if __name__ == "__main__":
             raise SystemExit(f"Failed to load config {args.config}: {exc}") from exc
 
     if args.tune:
-        run_optuna(cfg, n_trials=args.trials, save_path=args.save_params, objective_metric=args.objective)
+        run_optuna(
+            cfg,
+            n_trials=args.trials,
+            save_path=args.save_params,
+            objective_metric=args.objective,
+            study_name=args.study_name,
+            storage=args.storage,
+        )
     else:
         main(cfg)
