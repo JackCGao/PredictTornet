@@ -134,9 +134,9 @@ def _suggest_config(trial, base_config: Dict) -> Dict:
     if "epochs" in cfg:
         cfg["epochs"] = trial.suggest_int("epochs", 5, 15)
     if "batch_size" in cfg:
-        cfg["batch_size"] = trial.suggest_categorical("batch_size", [64, 96, 128, 192, 256])
+        cfg["batch_size"] = trial.suggest_categorical("batch_size", [64, 96, 128, 192])
     if "start_filters" in cfg:
-        cfg["start_filters"] = trial.suggest_categorical("start_filters", [32, 48, 64, 80])
+        cfg["start_filters"] = trial.suggest_categorical("start_filters", [32, 48, 64])
     if "learning_rate" in cfg:
         cfg["learning_rate"] = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
     if "decay_steps" in cfg:
@@ -164,7 +164,7 @@ def _suggest_config(trial, base_config: Dict) -> Dict:
     if "kernel_size" in cfg:
         cfg["kernel_size"] = trial.suggest_categorical("kernel_size", [3, 5])
     if "n_blocks" in cfg:
-        cfg["n_blocks"] = trial.suggest_int("n_blocks", 2, 4)
+        cfg["n_blocks"] = trial.suggest_int("n_blocks", 4, 4)
     if "convs_per_block" in cfg:
         cfg["convs_per_block"] = [
             trial.suggest_int("convs_block1", 1, 3),
