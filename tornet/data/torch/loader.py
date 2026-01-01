@@ -10,6 +10,7 @@ The software/firmware is provided to you on an As-Is basis
 Delivered to the U.S. Government with Unlimited Rights, as defined in DFARS Part 252.227-7013 or 7014 (Feb 2014). Notwithstanding any copyright notice, U.S. Government rights in this work are defined by DFARS 252.227-7013 or DFARS 252.227-7014 as detailed above. Use of this work other than as specifically authorized by the U.S. Government may violate any copyrights that exist in this work.
 """
 
+import os
 from functools import partial
 from typing import Dict
 
@@ -53,7 +54,8 @@ def make_torch_loader(data_root: str,
                 select_keys: list=None,
                 tilt_last: bool=True,
                 from_tfds: bool=False,
-                workers:int=8):
+                workers:int|None=None,
+                pin_memory: bool=False):
     """
     Initializes torch.utils.data.DataLoader for training CNN Tornet baseline.
 
@@ -86,6 +88,11 @@ def make_torch_loader(data_root: str,
     - Splits sample into inputs,label
     - If weights is provided, returns inputs,label,sample_weights
     """    
+    # Prefer to saturate available CPU cores by default, leaving one free for system tasks.
+    if workers is None:
+        cpu_total = os.cpu_count() or 1
+        workers = max(cpu_total - 1, 1)
+
     if from_tfds:
         import tensorflow_datasets as tfds
         import tornet.data.tfds.tornet.tornet_dataset_builder # registers 'tornet'
@@ -144,7 +151,13 @@ def make_torch_loader(data_root: str,
                                  tilt_last=tilt_last,
                                  transform=transform)
 
-    loader = torch.utils.data.DataLoader(dataset,batch_size=batch_size,num_workers=workers)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=workers,
+        pin_memory=pin_memory,
+        persistent_workers=workers > 0,
+    )
     return loader
 
     

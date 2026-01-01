@@ -336,6 +336,10 @@ def _prepare_dataloader_kwargs(config: Dict) -> Dict:
         + ["range_folded_mask", "coordinates"],
     )
     dataloader_kwargs.setdefault("select_keys", selected_keys)
+    # Use most CPU cores for data loading and pin memory for faster host-to-device transfer.
+    cpu_total = os.cpu_count() or 1
+    dataloader_kwargs.setdefault("workers", max(cpu_total - 1, 1))
+    dataloader_kwargs.setdefault("pin_memory", True)
     return dataloader_kwargs
 
 
