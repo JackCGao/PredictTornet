@@ -138,7 +138,7 @@ def _suggest_config(trial, base_config: Dict) -> Dict:
         cfg["batch_size"] = trial.suggest_categorical("batch_size", [64, 96, 128, 192])
     if "start_filters" in cfg:
         # Restrict to single choice to keep search space compatible across studies.
-        cfg["start_filters"] = trial.suggest_categorical("start_filters", [32, 48])
+        cfg["start_filters"] = trial.suggest_categorical("start_filters", [32, 48, 64])
     if "learning_rate" in cfg:
         cfg["learning_rate"] = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
     if "decay_steps" in cfg:
@@ -528,7 +528,7 @@ def run_optuna(
     n_trials: int = 1,
     save_path: Path | None = None,
     objective_metric: str = "multi",
-    study_name: str = "optuna_runV3",
+    study_name: str = "optuna_runV4",
     storage: str | None = "sqlite:///tornet_optuna.db",
 ):
     try:
@@ -675,8 +675,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--study-name",
         type=str,
-        default="optuna_runV3",
-        help="Optuna study name for persistent tuning (default: optuna_runV3).",
+        default="optuna_runV4",
+        help="Optuna study name for persistent tuning (default: optuna_runV4).",
     )
     parser.add_argument(
         "--storage",

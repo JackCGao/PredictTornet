@@ -1,5 +1,5 @@
 {
-    "epochs": 10,
+    "epochs": 11,
     "input_variables": [
         "DBZ",
         "VEL",
@@ -22,13 +22,13 @@
         2021,
         2022
     ],
-    "batch_size": 96,
+    "batch_size": 64,
     "model": "vgg",
-    "start_filters": 64,
-    "learning_rate": 0.00011649950857781792,
-    "decay_steps": 2327,
-    "decay_rate": 0.9669677250740126,
-    "l2_reg": 0.00021497722421646062,
+    "start_filters": 32,
+    "learning_rate": 0.0005010551964456147,
+    "decay_steps": 914,
+    "decay_rate": 0.9949930982305404,
+    "l2_reg": 2.192253736663786e-06,
     "kernel_size": 3,
     "n_blocks": 4,
     "convs_per_block": [
@@ -37,14 +37,14 @@
         3,
         3
     ],
-    "drop_rate": 0.35953941350092744,
-    "wN": 0.6302790012437076,
-    "w0": 2.3568674109805614,
-    "w1": 0.9315835983182642,
-    "w2": 3.3016769834170203,
-    "wW": 0.5761269661878798,
-    "label_smooth": 0.02936264187115646,
-    "head": "avgpool",
+    "drop_rate": 0.16858523753805538,
+    "wN": 1.716686766283548,
+    "w0": 2.3413447131625205,
+    "w1": 2.3609994159840175,
+    "w2": 3.5075605055569476,
+    "wW": 1.007912428906134,
+    "label_smooth": 0.018901258158023983,
+    "head": "maxpool",
     "exp_name": "tornado_baseline",
     "exp_dir": ".",
     "dataloader": "torch",
@@ -56,8 +56,8 @@
     "precision": "32-true",
     "log_every_n_steps": 25,
     "loss": "cce",
-    "convs_block1": 2,
-    "convs_block2": 1,
-    "convs_block3": 2,
-    "convs_block4": 3
+    "convs_block1": 1,
+    "convs_block2": 3,
+    "convs_block3": 3,
+    "convs_block4": 2
 }
