@@ -9,95 +9,74 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
-from typing import List, Sequence
+from typing import Dict, List, Sequence
 
 import matplotlib
 
 matplotlib.use("Agg")  # Safe for headless by default; set MPLBACKEND to override.
 import matplotlib.pyplot as plt
 import numpy as np
-import xarray as xr
 
 from tornet.data.constants import ALL_VARIABLES
-
-def _select_frame(arr: np.ndarray, frame_idx: int) -> np.ndarray:
-    """Return a single time slice, handling negative indexing and clamping."""
-    if arr.ndim == 0:
-        raise ValueError("Array has no dimensions; cannot select frame.")
-    total = arr.shape[0]
-    idx = frame_idx if frame_idx >= 0 else total + frame_idx
-    idx = max(0, min(total - 1, idx))
-    return arr[idx]
+from tornet.data.loader import read_file
+from tornet.display.display import plot_radar
 
 
-def _split_tilts(frame: np.ndarray, tilt_index: int | None) -> List[np.ndarray]:
-    """Split a frame into per-tilt 2D arrays (azimuth x range)."""
-    if frame.ndim == 2:
-        tilts = [frame]
-    elif frame.ndim == 3:
-        tilts = [frame[:, :, i] for i in range(frame.shape[-1])]
-    else:
-        tilts = [np.squeeze(frame)]
+def _grid_for_channels(n_channels: int) -> tuple[int, int]:
+    """Pick a rows/cols grid similar to the notebook (2x3 for 6 vars)."""
 
-    if tilt_index is not None:
-        if 0 <= tilt_index < len(tilts):
-            return [tilts[tilt_index]]
-        raise IndexError(f"Requested tilt_index {tilt_index} but only {len(tilts)} tilts available.")
-    return tilts
+    if n_channels <= 3:
+        return (1, n_channels)
+    if n_channels <= 6:
+        return (2, 3)
+    cols = int(np.ceil(np.sqrt(n_channels)))
+    rows = int(np.ceil(n_channels / cols))
+    return rows, cols
 
 
-def _load_variables(ds: xr.Dataset, variables: Sequence[str], frame_idx: int, tilt_index: int | None):
-    data = []
-    max_tilts = 0
-    for var in variables:
-        if var not in ds:
-            continue
-        arr = ds[var].values
-        frame = _select_frame(arr, frame_idx)
-        tilts = _split_tilts(frame, tilt_index)
-        data.append((var, tilts))
-        max_tilts = max(max_tilts, len(tilts))
-    if not data:
-        raise RuntimeError("None of the requested variables were found in the dataset.")
-    return data, max_tilts
+def _load_sample_for_radar(path: Path, variables: Sequence[str]) -> Dict[str, np.ndarray]:
+    """Use the existing loader helper so the structure matches plot_radar expectations."""
+
+    data = read_file(str(path), variables=variables, tilt_last=True)
+    return data
 
 
 def plot_file(path: Path, variables: Sequence[str], frame_idx: int, tilt_index: int | None, save_path: Path | None):
-    with xr.open_dataset(path) as ds:
-        var_data, max_tilts = _load_variables(ds, variables, frame_idx, tilt_index)
+    data = _load_sample_for_radar(path, variables)
+    # Clamp indices to available frames/tilts to avoid crashes.
+    time_len = data[variables[0]].shape[0]
+    time_idx = frame_idx if frame_idx >= 0 else time_len + frame_idx
+    time_idx = max(0, min(time_len - 1, time_idx))
 
-        fig, axes = plt.subplots(
-            len(var_data),
-            max_tilts,
-            figsize=(4 * max_tilts, 3 * len(var_data)),
-            squeeze=False,
-        )
+    n_tilts = data[variables[0]].shape[-1] if data[variables[0]].ndim >= 3 else 1
+    chosen_tilt = tilt_index if tilt_index is not None else 0
+    chosen_tilt = max(0, min(n_tilts - 1, chosen_tilt))
+    sweep_idx = [chosen_tilt] * len(variables)
 
-        for row, (var, tilts) in enumerate(var_data):
-            for col in range(max_tilts):
-                ax = axes[row][col]
-                if col >= len(tilts):
-                    ax.axis("off")
-                    continue
-                im = ax.imshow(tilts[col], aspect="auto", origin="lower")
-                ax.set_title(f"{var} tilt {col}")
-                ax.set_xlabel("Range bin")
-                if col == 0:
-                    ax.set_ylabel("Azimuth bin")
-                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    n_rows, n_cols = _grid_for_channels(len(variables))
 
-        fig.suptitle(f"{path.name} | frame {frame_idx} | tilts {tilt_index if tilt_index is not None else 'all'}")
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig = plt.figure(figsize=(12, 6), edgecolor="k")
+    plot_radar(
+        data,
+        channels=list(variables),
+        fig=fig,
+        time_idx=time_idx,
+        sweep_idx=sweep_idx,
+        include_cbar=True,
+        n_rows=n_rows,
+        n_cols=n_cols,
+    )
+    fig.suptitle(f"{path.name} | frame {time_idx}", y=0.98)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
 
-        if save_path:
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(save_path, dpi=150)
-            print(f"Saved plot to {save_path}")
-        else:
-            plt.show()
-        plt.close(fig)
+    if save_path:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150)
+        print(f"Saved plot to {save_path}")
+    else:
+        plt.show()
+    plt.close(fig)
 
 
 def _safe_relpath(path: Path, root: Path | None) -> Path:
