@@ -18,7 +18,6 @@ import logging
 import os
 import shutil
 import sys
-import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -132,13 +131,21 @@ def _suggest_config(trial, base_config: Dict) -> Dict:
     Only parameters found in params.json/defaults are sampled.
     """
     cfg = deepcopy(base_config)
+    # Sample batch size first so we can condition the rest of the search space to stay lightweight.
+    batch_size = None
     if "epochs" in cfg:
         cfg["epochs"] = trial.suggest_int("epochs", 5, 15)
     if "batch_size" in cfg:
-        cfg["batch_size"] = trial.suggest_categorical("batch_size", [64, 96, 128, 192])
+        batch_size = trial.suggest_categorical("batch_size", [64, 96, 128, 192])
+        cfg["batch_size"] = batch_size
+    # Constrain heavy params when batches are large to avoid OOM/runtime blowups.
+    heavy_batch = batch_size is not None and batch_size >= 128
+    start_filter_choices = [32, 48] if heavy_batch else [32, 48, 64]
+    kernel_choices = [3] if heavy_batch else [3, 5]
+    conv_low_high = (1, 3) if heavy_batch else (1, 4)
+    deep_low_high = (2, 3) if heavy_batch else (2, 4)
     if "start_filters" in cfg:
-        # Restrict to single choice to keep search space compatible across studies.
-        cfg["start_filters"] = trial.suggest_categorical("start_filters", [32, 48, 64])
+        cfg["start_filters"] = trial.suggest_categorical("start_filters", start_filter_choices)
     if "learning_rate" in cfg:
         cfg["learning_rate"] = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
     if "decay_steps" in cfg:
@@ -164,15 +171,15 @@ def _suggest_config(trial, base_config: Dict) -> Dict:
     if "loss" in cfg:
         cfg["loss"] = trial.suggest_categorical("loss", ["cce", "bce"])
     if "kernel_size" in cfg:
-        cfg["kernel_size"] = trial.suggest_categorical("kernel_size", [3, 5])
+        cfg["kernel_size"] = trial.suggest_categorical("kernel_size", kernel_choices)
     if "n_blocks" in cfg:
         cfg["n_blocks"] = trial.suggest_int("n_blocks", 4, 4)
     if "convs_per_block" in cfg:
         cfg["convs_per_block"] = [
-            trial.suggest_int("convs_block1", 1, 3),
-            trial.suggest_int("convs_block2", 1, 3),
-            trial.suggest_int("convs_block3", 2, 4),
-            trial.suggest_int("convs_block4", 2, 4),
+            trial.suggest_int("convs_block1", *conv_low_high),
+            trial.suggest_int("convs_block2", *conv_low_high),
+            trial.suggest_int("convs_block3", *deep_low_high),
+            trial.suggest_int("convs_block4", *deep_low_high),
         ]
     if "drop_rate" in cfg:
         cfg["drop_rate"] = trial.suggest_float("drop_rate", 0.1, 0.4)
@@ -277,20 +284,18 @@ def _wrap_loader_for_lightning(loader: DataLoader) -> DataLoader:
     loader with a collate_fn that reattaches labels (and optional weights) to the dict.
     """
 
-    loader_kwargs = {
-        "dataset": loader.dataset,
-        "batch_size": loader.batch_size,
-        "num_workers": loader.num_workers,
-        "shuffle": False,
-        "drop_last": False,
-        "pin_memory": loader.pin_memory,
-        # Avoid keeping workers alive across epochs to reduce host/shm pressure.
-        "persistent_workers": False,
-        "collate_fn": _lightning_collate,
-    }
-    if loader.num_workers and loader.num_workers > 0:
-        loader_kwargs["prefetch_factor"] = 1
-    return DataLoader(**loader_kwargs)
+    return DataLoader(
+        loader.dataset,
+        batch_size=loader.batch_size,
+        num_workers=loader.num_workers,
+        shuffle=False,
+        drop_last=False,
+        pin_memory=loader.pin_memory,
+        persistent_workers=(
+            getattr(loader, "persistent_workers", False) and loader.num_workers > 0
+        ),
+        collate_fn=_lightning_collate,
+    )
 
 
 def _infer_input_shapes(
@@ -340,11 +345,10 @@ def _prepare_dataloader_kwargs(config: Dict) -> Dict:
         + ["range_folded_mask", "coordinates"],
     )
     dataloader_kwargs.setdefault("select_keys", selected_keys)
-    # Keep loader lightweight to avoid host/OOM kills during validation.
-    cpu_total = os.cpu_count() or 2
-    conservative_workers = min(4, max(cpu_total - 1, 1))
-    dataloader_kwargs.setdefault("workers", conservative_workers)
-    dataloader_kwargs.setdefault("pin_memory", False)
+    # Use most CPU cores for data loading and pin memory for faster host-to-device transfer.
+    cpu_total = os.cpu_count() or 1
+    dataloader_kwargs.setdefault("workers", max(cpu_total - 1, 1))
+    dataloader_kwargs.setdefault("pin_memory", True)
     return dataloader_kwargs
 
 
@@ -525,10 +529,10 @@ def main(config: Dict):
 
 def run_optuna(
     base_config: Dict,
-    n_trials: int = 1,
+    n_trials: int = 10,
     save_path: Path | None = None,
-    objective_metric: str = "multi",
-    study_name: str = "optuna_runV4",
+    objective_metric: str = "auc",
+    study_name: str = "tornet_optuna",
     storage: str | None = "sqlite:///tornet_optuna.db",
 ):
     try:
@@ -565,50 +569,25 @@ def run_optuna(
         trial.set_user_attr("CSI", csi)
         return auc, aucpr, csi
 
-    def _run_with_fallback(create_kwargs, objective_fn):
-        try:
-            study = optuna.create_study(**create_kwargs)
-            study.optimize(objective_fn, n_trials=n_trials)
-            return study
-        except ValueError as exc:
-            if "dynamic value space" not in str(exc).lower():
-                raise
-            # Existing study has incompatible search space; start a fresh one.
-            fresh_name = f"{create_kwargs['study_name']}_reset_{int(time.time())}"
-            logging.warning(
-                "Optuna study '%s' had incompatible search space; creating fresh study '%s'.",
-                create_kwargs["study_name"],
-                fresh_name,
-            )
-            create_kwargs = dict(create_kwargs)
-            create_kwargs['study_name'] = fresh_name
-            study = optuna.create_study(**create_kwargs)
-            study.optimize(objective_fn, n_trials=n_trials)
-            return study
-
     if metric_key == "MULTI":
-        study = _run_with_fallback(
-            {
-                "study_name": study_name,
-                "storage": storage,
-                "load_if_exists": True,
-                "directions": ["maximize", "maximize", "maximize"],
-            },
-            objective_multi,
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=storage,
+            load_if_exists=True,
+            directions=["maximize", "maximize", "maximize"],
         )
+        study.optimize(objective_multi, n_trials=n_trials)
         # pick a representative best trial (highest AUC among Pareto front)
         best = max(study.best_trials, key=lambda t: t.values[0])
         best_value = best.values
     else:
-        study = _run_with_fallback(
-            {
-                "study_name": study_name,
-                "storage": storage,
-                "load_if_exists": True,
-                "direction": "maximize",
-            },
-            objective_single,
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=storage,
+            load_if_exists=True,
+            direction="maximize",
         )
+        study.optimize(objective_single, n_trials=n_trials)
         best = study.best_trial
         best_value = best.value
 
@@ -644,20 +623,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tune",
         action="store_true",
-        default=True,
-        help="Run Optuna hyperparameter search instead of a single training run (default: on).",
-    )
-    parser.add_argument(
-        "--no-tune",
-        action="store_false",
-        dest="tune",
-        help="Disable Optuna tuning and run a single training run.",
+        help="Run Optuna hyperparameter search instead of a single training run.",
     )
     parser.add_argument(
         "--trials",
         type=int,
-        default=1,
-        help="Number of Optuna trials to run when --tune is set (default: 1).",
+        default=10,
+        help="Number of Optuna trials to run when --tune is set (default: 10).",
     )
     parser.add_argument(
         "--save-params",
@@ -675,8 +647,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--study-name",
         type=str,
-        default="optuna_runV4",
-        help="Optuna study name for persistent tuning (default: optuna_runV4).",
+        default="tornet_optuna",
+        help="Optuna study name for persistent tuning (default: tornet_optuna).",
     )
     parser.add_argument(
         "--storage",

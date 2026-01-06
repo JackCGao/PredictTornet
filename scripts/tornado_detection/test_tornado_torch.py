@@ -84,6 +84,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force inclusion of range_folded_mask feature if your checkpoint expects it.",
     )
+    parser.add_argument(
+        "--use-best-optuna",
+        action="store_true",
+        help="Load the best trial params from the Optuna study and apply them for evaluation.",
+    )
+    parser.add_argument(
+        "--optuna-storage",
+        default="sqlite:///tornet_optuna.db",
+        help="Optuna storage URL (default: sqlite:///tornet_optuna.db).",
+    )
+    parser.add_argument(
+        "--optuna-study",
+        default="tornet_optuna",
+        help="Optuna study name (default: tornet_optuna).",
+    )
     return parser
 
 
@@ -184,6 +199,20 @@ def _load_training_config(checkpoint_path: Path) -> Dict[str, Any]:
         return config if isinstance(config, dict) else {}
     return {}
 
+
+def _load_best_optuna_params(storage: str, study_name: str) -> Dict[str, Any]:
+    """Load best trial parameters from an Optuna study."""
+
+    try:
+        import optuna
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise SystemExit("optuna is required to load best trial params. Install with `pip install optuna`.") from exc
+
+    study = optuna.load_study(study_name=study_name, storage=storage)
+    best = study.best_trial
+    logging.info("Loaded best Optuna trial %s (value=%s)", best.number, best.value)
+    return dict(best.params)
+
 def _drop_missing_files(loader: DataLoader, loader_name: str) -> None:
     """
     Remove entries from the dataloader's file list if the files are missing on disk.
@@ -249,6 +278,9 @@ def main():
             "Specify one with --checkpoint."
         )
     train_cfg = _load_training_config(checkpoint_path)
+    if args.use_best_optuna:
+        best_params = _load_best_optuna_params(args.optuna_storage, args.optuna_study)
+        train_cfg.update(best_params)
 
     input_variables = train_cfg.get("input_variables", ALL_VARIABLES)
     dataloader_kwargs_cfg = train_cfg.get("dataloader_kwargs", {})
@@ -260,13 +292,14 @@ def main():
         ),
     }
     weights = None
+    batch_size = int(train_cfg.get("batch_size", args.batch_size))
 
     ds = get_dataloader(
         args.dataloader,
         DATA_ROOT,
         years=list(range(2013, 2023)),
         data_type="test",
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         weights=weights,
         **dataloader_kwargs,
     )
