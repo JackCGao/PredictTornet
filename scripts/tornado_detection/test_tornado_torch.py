@@ -1,15 +1,3 @@
-"""
-DISTRIBUTION STATEMENT A. Approved for public release. Distribution is unlimited.
-
-This material is based upon work supported by the Department of the Air Force under Air Force Contract No. FA8702-15-D-0001. Any opinions, findings, conclusions or recommendations expressed in this material are those of the author(s) and do not necessarily reflect the views of the Department of the Air Force.
-
-© 2024 Massachusetts Institute of Technology.
-
-The software/firmware is provided to you on an As-Is basis
-
-Delivered to the U.S. Government with Unlimited Rights, as defined in DFARS Part 252.227-7013 or 7014 (Feb 2014). Notwithstanding any copyright notice, U.S. Government rights in this work are defined by DFARS 252.227-7013 or DFARS 252.227-7014 as detailed above. Use of this work other than as specifically authorized by the U.S. Government may violate any copyrights that exist in this work.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -20,6 +8,14 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
+try:  # pragma: no cover - optional dependency
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:  # pragma: no cover
+    plt = None
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -98,6 +94,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--optuna-study",
         default="tornet_optuna",
         help="Optuna study name (default: tornet_optuna).",
+    )
+    parser.add_argument(
+        "--grad-cam",
+        action="store_true",
+        help="If set, generate Grad-CAM plots for a subset of samples.",
+    )
+    parser.add_argument(
+        "--grad-cam-output",
+        type=Path,
+        default=Path("grad_cam"),
+        help="Directory to save Grad-CAM plots (default: grad_cam).",
+    )
+    parser.add_argument(
+        "--grad-cam-samples",
+        type=int,
+        default=2,
+        help="Maximum number of samples to render Grad-CAM plots for.",
+    )
+    parser.add_argument(
+        "--grad-cam-tilt-index",
+        type=int,
+        default=0,
+        help="Tilt index to plot when rendering Grad-CAM (default: 0).",
     )
     return parser
 
@@ -262,6 +281,159 @@ def _find_default_checkpoint() -> Path | None:
     return ckpts[0] if ckpts else None
 
 
+class _GradCAM:
+    """Lightweight Grad-CAM helper that hooks into a target module."""
+
+    def __init__(self, target_module: torch.nn.Module):
+        self.activations: torch.Tensor | None = None
+        self.gradients: torch.Tensor | None = None
+        self.handles = [
+            target_module.register_forward_hook(self._forward_hook),
+            target_module.register_full_backward_hook(self._backward_hook),
+        ]
+
+    def _forward_hook(self, _module, _inputs, output):
+        self.activations = output
+
+    def _backward_hook(self, _module, _grad_inputs, grad_outputs):
+        self.gradients = grad_outputs[0]
+
+    def clear(self):
+        self.activations = None
+        self.gradients = None
+
+    def remove(self):
+        for h in self.handles:
+            h.remove()
+
+    def build_cam(self) -> torch.Tensor:
+        if self.activations is None or self.gradients is None:
+            raise RuntimeError("Grad-CAM hooks did not capture activations/gradients.")
+        weights = self.gradients.mean(dim=(2, 3), keepdim=True)
+        cam = (weights * self.activations).sum(dim=1)
+        cam = F.relu(cam)
+        cam_min = cam.amin(dim=(1, 2), keepdim=True)
+        cam_max = cam.amax(dim=(1, 2), keepdim=True)
+        return (cam - cam_min) / (cam_max - cam_min + 1e-6)
+
+
+def _safe_filename(file_list: List[str] | None, idx: int) -> str:
+    if file_list and 0 <= idx < len(file_list):
+        return Path(file_list[idx]).with_suffix("").name
+    return f"sample_{idx}"
+
+
+def _prepare_plot_sample(
+    batch: Dict[str, torch.Tensor], sample_idx: int, variables: Iterable[str], tilt_last: bool
+) -> Dict[str, np.ndarray]:
+    """Format a single sample for plot_radar (tilt-last with time dim)."""
+
+    data: Dict[str, np.ndarray] = {}
+    for key, value in batch.items():
+        if not torch.is_tensor(value):
+            continue
+        arr = value[sample_idx].detach().cpu().numpy()
+        data[key] = arr
+
+    for key, arr in list(data.items()):
+        if key in variables or key == "range_folded_mask":
+            if not tilt_last:
+                if arr.ndim == 3:
+                    arr = np.transpose(arr, (1, 2, 0))
+                elif arr.ndim == 4:
+                    arr = np.transpose(arr, (0, 2, 3, 1))
+            if arr.ndim == 3:
+                arr = arr[None, ...]
+            data[key] = arr
+        elif np.isscalar(arr):
+            data[key] = np.array([arr])
+        else:
+            data[key] = arr
+    return data
+
+
+def _generate_grad_cam_plots(
+    classifier: TornadoClassifier,
+    loader: DataLoader,
+    variables: List[str],
+    tilt_last: bool,
+    out_dir: Path,
+    max_samples: int,
+    file_list: List[str] | None,
+    tilt_index: int,
+    device: torch.device,
+):
+    if plt is None:  # pragma: no cover - optional dependency
+        logging.warning("matplotlib unavailable; skipping Grad-CAM plots.")
+        return
+    try:
+        from tornet.display.display import plot_radar
+    except Exception as exc:  # pragma: no cover - optional dependency
+        logging.warning("tornet.display.display unavailable; skipping Grad-CAM plots: %s", exc)
+        return
+
+    grad_cam = _GradCAM(classifier.model.head[-1])
+    saved = 0
+    sample_index = 0
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for batch in loader:
+        if saved >= max_samples:
+            break
+        batch_for_plot = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
+        batch = _move_to_device(batch, device)
+        batch.pop("label", None)
+        batch.pop("sample_weights", None)
+
+        grad_cam.clear()
+        classifier.zero_grad(set_to_none=True)
+        with torch.enable_grad():
+            logits = classifier.model(batch)
+            pooled = F.max_pool2d(logits, kernel_size=logits.size()[2:])
+            score = torch.squeeze(pooled)
+            if score.ndim == 0:
+                score = score.unsqueeze(0)
+            score.sum().backward()
+            cams = grad_cam.build_cam().detach().cpu()
+
+        batch_size = cams.shape[0]
+        for i in range(batch_size):
+            if saved >= max_samples:
+                break
+            plot_data = _prepare_plot_sample(batch_for_plot, i, variables, tilt_last)
+            cam_np = cams[i].numpy()
+            plot_data["cnn_output"] = cam_np[None, ..., None]
+            file_tag = _safe_filename(file_list, sample_index + i)
+
+            tilt_for_plot = 0
+            var_shape = plot_data[variables[0]].shape if variables else None
+            if var_shape and len(var_shape) == 4:
+                tilt_for_plot = min(max(tilt_index, 0), max(var_shape[-1] - 1, 0))
+
+            for var in variables:
+                fig = plt.figure(figsize=(10, 4), edgecolor="k")
+                plot_radar(
+                    plot_data,
+                    channels=[var, "cnn_output"],
+                    fig=fig,
+                    time_idx=0,
+                    sweep_idx=[tilt_for_plot, 0],
+                    include_cbar=True,
+                    n_rows=1,
+                    n_cols=2,
+                )
+                fig.suptitle(f"{file_tag} | {var}", y=0.98)
+                fig.tight_layout(rect=[0, 0, 1, 0.96])
+                out_path = out_dir / f"{file_tag}_{var}_gradcam.png"
+                fig.savefig(out_path, dpi=150)
+                plt.close(fig)
+            saved += 1
+        sample_index += batch_size
+
+    grad_cam.remove()
+    logging.info("Saved %d Grad-CAM sample(s) to %s", saved, out_dir)
+
+
 def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
@@ -397,6 +569,18 @@ def main():
             len(false_catalog["false_positives"]),
             len(false_catalog["false_negatives"]),
             out_path,
+        )
+    if args.grad_cam:
+        _generate_grad_cam_plots(
+            classifier=classifier,
+            loader=ds,
+            variables=input_variables,
+            tilt_last=dataloader_kwargs["tilt_last"],
+            out_dir=args.grad_cam_output,
+            max_samples=args.grad_cam_samples,
+            file_list=file_list,
+            tilt_index=args.grad_cam_tilt_index,
+            device=device,
         )
 
 

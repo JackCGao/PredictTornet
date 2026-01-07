@@ -1,10 +1,3 @@
-"""
-Quick visualization of all radar variables for a single TorNet NetCDF sample.
-
-Example:
-    python visualize_samples.py /path/to/sample.nc --frame -1 --variables DBZ VEL
-"""
-
 from __future__ import annotations
 
 import argparse
