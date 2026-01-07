@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -284,18 +285,20 @@ def _wrap_loader_for_lightning(loader: DataLoader) -> DataLoader:
     loader with a collate_fn that reattaches labels (and optional weights) to the dict.
     """
 
-    return DataLoader(
-        loader.dataset,
-        batch_size=loader.batch_size,
-        num_workers=loader.num_workers,
-        shuffle=False,
-        drop_last=False,
-        pin_memory=loader.pin_memory,
-        persistent_workers=(
-            getattr(loader, "persistent_workers", False) and loader.num_workers > 0
-        ),
-        collate_fn=_lightning_collate,
-    )
+    loader_kwargs = {
+        "dataset": loader.dataset,
+        "batch_size": loader.batch_size,
+        "num_workers": loader.num_workers,
+        "shuffle": False,
+        "drop_last": False,
+        "pin_memory": loader.pin_memory,
+        # Avoid keeping workers alive across epochs to reduce host/shm pressure.
+        "persistent_workers": False,
+        "collate_fn": _lightning_collate,
+    }
+    if loader.num_workers and loader.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 1
+    return DataLoader(**loader_kwargs)
 
 
 def _infer_input_shapes(
@@ -345,10 +348,11 @@ def _prepare_dataloader_kwargs(config: Dict) -> Dict:
         + ["range_folded_mask", "coordinates"],
     )
     dataloader_kwargs.setdefault("select_keys", selected_keys)
-    # Use most CPU cores for data loading and pin memory for faster host-to-device transfer.
-    cpu_total = os.cpu_count() or 1
-    dataloader_kwargs.setdefault("workers", max(cpu_total - 1, 1))
-    dataloader_kwargs.setdefault("pin_memory", True)
+    # Keep loader lightweight to avoid host/OOM kills during validation.
+    cpu_total = os.cpu_count() or 2
+    conservative_workers = min(4, max(cpu_total - 1, 1))
+    dataloader_kwargs.setdefault("workers", conservative_workers)
+    dataloader_kwargs.setdefault("pin_memory", False)
     return dataloader_kwargs
 
 
@@ -529,10 +533,10 @@ def main(config: Dict):
 
 def run_optuna(
     base_config: Dict,
-    n_trials: int = 10,
+    n_trials: int = 3,
     save_path: Path | None = None,
-    objective_metric: str = "auc",
-    study_name: str = "tornet_optuna",
+    objective_metric: str = "multi",
+    study_name: str = "optuna_runV6",
     storage: str | None = "sqlite:///tornet_optuna.db",
 ):
     try:
@@ -569,25 +573,50 @@ def run_optuna(
         trial.set_user_attr("CSI", csi)
         return auc, aucpr, csi
 
+    def _run_with_fallback(create_kwargs, objective_fn):
+        try:
+            study = optuna.create_study(**create_kwargs)
+            study.optimize(objective_fn, n_trials=n_trials)
+            return study
+        except ValueError as exc:
+            if "dynamic value space" not in str(exc).lower():
+                raise
+            # Existing study has incompatible search space; start a fresh one.
+            fresh_name = f"{create_kwargs['study_name']}_reset_{int(time.time())}"
+            logging.warning(
+                "Optuna study '%s' had incompatible search space; creating fresh study '%s'.",
+                create_kwargs["study_name"],
+                fresh_name,
+            )
+            create_kwargs = dict(create_kwargs)
+            create_kwargs['study_name'] = fresh_name
+            study = optuna.create_study(**create_kwargs)
+            study.optimize(objective_fn, n_trials=n_trials)
+            return study
+
     if metric_key == "MULTI":
-        study = optuna.create_study(
-            study_name=study_name,
-            storage=storage,
-            load_if_exists=True,
-            directions=["maximize", "maximize", "maximize"],
+        study = _run_with_fallback(
+            {
+                "study_name": study_name,
+                "storage": storage,
+                "load_if_exists": True,
+                "directions": ["maximize", "maximize", "maximize"],
+            },
+            objective_multi,
         )
-        study.optimize(objective_multi, n_trials=n_trials)
         # pick a representative best trial (highest AUC among Pareto front)
         best = max(study.best_trials, key=lambda t: t.values[0])
         best_value = best.values
     else:
-        study = optuna.create_study(
-            study_name=study_name,
-            storage=storage,
-            load_if_exists=True,
-            direction="maximize",
+        study = _run_with_fallback(
+            {
+                "study_name": study_name,
+                "storage": storage,
+                "load_if_exists": True,
+                "direction": "maximize",
+            },
+            objective_single,
         )
-        study.optimize(objective_single, n_trials=n_trials)
         best = study.best_trial
         best_value = best.value
 
@@ -623,13 +652,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tune",
         action="store_true",
-        help="Run Optuna hyperparameter search instead of a single training run.",
+        default=True,
+        help="Run Optuna hyperparameter search instead of a single training run (default: on).",
+    )
+    parser.add_argument(
+        "--no-tune",
+        action="store_false",
+        dest="tune",
+        help="Disable Optuna tuning and run a single training run.",
     )
     parser.add_argument(
         "--trials",
         type=int,
-        default=10,
-        help="Number of Optuna trials to run when --tune is set (default: 10).",
+        default=3,
+        help="Number of Optuna trials to run when --tune is set (default: 3).",
     )
     parser.add_argument(
         "--save-params",
@@ -647,8 +683,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--study-name",
         type=str,
-        default="tornet_optuna",
-        help="Optuna study name for persistent tuning (default: tornet_optuna).",
+        default="optuna_runV6",
+        help="Optuna study name for persistent tuning (default: optuna_runV6).",
     )
     parser.add_argument(
         "--storage",
