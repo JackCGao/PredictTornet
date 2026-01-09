@@ -31,13 +31,17 @@ from torchmetrics.classification import (
     BinaryRecall,
     BinaryStatScores,
 )
+from torchmetrics.functional.classification import (
+    binary_precision_recall_curve,
+    binary_roc,
+)
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from tornet.data.constants import ALL_VARIABLES
-from tornet.data.loader import get_dataloader
+from tornet.data.loader import get_dataloader, read_file
 from tornet.models.torch.cnn_baseline import TornadoClassifier, TornadoLikelihood
 
 logging.basicConfig(level=logging.INFO)
@@ -81,10 +85,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force inclusion of range_folded_mask feature if your checkpoint expects it.",
     )
-    parser.add_argument(
+    optuna_group = parser.add_mutually_exclusive_group()
+    optuna_group.add_argument(
         "--use-best-optuna",
         action="store_true",
-        help="Load the best trial params from the Optuna study and apply them for evaluation.",
+        default=True,
+        help=(
+            "Load the best trial params from the Optuna study and apply them for evaluation "
+            "(default: enabled)."
+        ),
+    )
+    optuna_group.add_argument(
+        "--no-best-optuna",
+        dest="use_best_optuna",
+        action="store_false",
+        help="Disable loading the best Optuna trial params.",
     )
     parser.add_argument(
         "--optuna-storage",
@@ -192,6 +207,7 @@ def _build_metrics(device: torch.device) -> MetricCollection:
         {
             "AUC": BinaryAUROC(),
             "AUCPR": BinaryAveragePrecision(),
+            "AUCPD": BinaryAveragePrecision(),
             "BinaryAccuracy": BinaryAccuracy(),
             "Precision": BinaryPrecision(),
             "Recall": BinaryRecall(),
@@ -469,6 +485,15 @@ def _safe_filename(file_list: List[str] | None, idx: int) -> str:
         return Path(file_list[idx]).with_suffix("").name
     return f"sample_{idx}"
 
+def _grid_for_channels(n_channels: int) -> Tuple[int, int]:
+    if n_channels <= 3:
+        return (1, n_channels)
+    if n_channels <= 6:
+        return (2, 3)
+    cols = int(np.ceil(np.sqrt(n_channels)))
+    rows = int(np.ceil(n_channels / cols))
+    return rows, cols
+
 
 def _prepare_plot_sample(
     batch: Dict[str, torch.Tensor], sample_idx: int, variables: Iterable[str], tilt_last: bool
@@ -581,38 +606,152 @@ def _generate_grad_cam_plots(
     logging.info("Saved %d Grad-CAM sample(s) to %s", saved, out_dir)
 
 
-def _plot_metric_summary(metrics: Dict[str, float], out_dir: Path, model_label: str = "TorSight"):
+def _plot_metric_curves(
+    metrics: Dict[str, float],
+    probs: torch.Tensor,
+    labels: torch.Tensor,
+    out_dir: Path,
+    model_label: str = "TorSight",
+):
     if plt is None:  # pragma: no cover - optional dependency
-        logging.warning("matplotlib unavailable; skipping metric plot.")
+        logging.warning("matplotlib unavailable; skipping metric plots.")
         return
-    targets = [("CSI", "CSI"), ("AUC", "AUC"), ("AUCPR", "AUCPD")]
-    entries = [(label, float(metrics[key])) for key, label in targets if key in metrics]
-    if not entries:
-        logging.warning("No metrics available for plotting; skipping metric plot.")
-        return
-
-    labels, values = zip(*entries)
-    x = np.arange(len(labels))
-    width = 0.6
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(6, 4))
-    bars = ax.bar(x, values, width, color="#1f77b4")
-    ax.set_ylim(0, 1.05)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.set_ylabel("Score")
-    ax.set_title("TorSight Evaluation Metrics")
-    ax.legend([bars[0]], [model_label], title="Model")
 
-    for bar, val in zip(bars, values):
-        ax.annotate(f"{val:.3f}", xy=(bar.get_x() + bar.get_width() / 2, val), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=8)
+    try:
+        fpr, tpr, _ = binary_roc(probs, labels)
+    except Exception as exc:  # pragma: no cover - safety net
+        logging.warning("Could not compute ROC curve: %s", exc)
+        fpr, tpr = None, None
 
-    fig.tight_layout()
-    out_path = out_dir / "torsight_metrics.png"
+    if fpr is not None and tpr is not None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(fpr.cpu(), tpr.cpu(), color="#1f77b4", label=model_label)
+        ax.plot([0, 1], [0, 1], linestyle="--", color="#999999", linewidth=1)
+        ax.set_xlabel("False Positive Rate")
+        ax.set_ylabel("True Positive Rate")
+        auc_val = metrics.get("AUC")
+        title = "ROC Curve"
+        if auc_val is not None:
+            title = f"ROC Curve (AUC={auc_val:.3f})"
+        ax.set_title(title)
+        ax.legend(loc="lower right")
+        fig.tight_layout()
+        out_path = out_dir / "roc_auc.png"
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        logging.info("Saved ROC plot to %s", out_path)
+
+    try:
+        precision, recall, _ = binary_precision_recall_curve(probs, labels)
+    except Exception as exc:  # pragma: no cover - safety net
+        logging.warning("Could not compute precision-recall curve: %s", exc)
+        precision, recall = None, None
+
+    if precision is not None and recall is not None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(recall.cpu(), precision.cpu(), color="#2ca02c", label=model_label)
+        ax.set_xlabel("Recall")
+        ax.set_ylabel("Precision")
+        aucpd_val = metrics.get("AUCPD")
+        title = "Precision-Recall Curve"
+        if aucpd_val is not None:
+            title = f"Precision-Recall Curve (AUCPD={aucpd_val:.3f})"
+        ax.set_title(title)
+        ax.legend(loc="lower left")
+        fig.tight_layout()
+        out_path = out_dir / "pr_aucpd.png"
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        logging.info("Saved AUCPD plot to %s", out_path)
+
+        precision_t = precision.cpu().numpy()
+        recall_t = recall.cpu().numpy()
+
+        tvs_csi = 0.2002
+        tvs_sr = 2.0 / (1.0 / tvs_csi + 1.0)
+        tvs_tpr = tvs_sr
+
+        sr_vals = np.linspace(0.01, 1.0, 100)
+        pod_vals = np.linspace(0.01, 1.0, 100)
+        sr_grid, pod_grid = np.meshgrid(sr_vals, pod_vals)
+        denom = (1.0 / sr_grid) + (1.0 / pod_grid) - 1.0
+        csi_grid = np.where(denom > 0, 1.0 / denom, np.nan)
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        levels = np.linspace(0.0, 1.0, 11)
+        contour = ax.contourf(sr_grid, pod_grid, csi_grid, levels=levels, cmap="Blues")
+        cbar = fig.colorbar(contour, ax=ax)
+        cbar.set_label("Critical Success Index (CSI)")
+        ax.plot(precision_t, recall_t, color="#d62728", label=model_label)
+        ax.scatter([tvs_sr], [tvs_tpr], marker="v", color="black", label="TVS", zorder=3)
+        ax.set_xlim(0, 1.0)
+        ax.set_ylim(0, 1.0)
+        ax.set_xlabel("Success Rate")
+        ax.set_ylabel("True Positive Rate")
+        ax.set_title("Performance Diagram (CSI)")
+        ax.legend(loc="upper right")
+        fig.tight_layout()
+        out_path = out_dir / "csi_performance.png"
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        logging.info("Saved CSI plot to %s", out_path)
+
+def _plot_success_case(
+    sample_path: Path | None,
+    variables: List[str],
+    out_dir: Path,
+    label: str,
+):
+    if plt is None:  # pragma: no cover - optional dependency
+        logging.warning("matplotlib unavailable; skipping success-case plot.")
+        return
+    try:
+        from tornet.display.display import plot_radar
+    except Exception as exc:  # pragma: no cover - optional dependency
+        logging.warning("tornet.display.display unavailable; skipping success-case plot: %s", exc)
+        return
+
+    if not variables:
+        logging.warning("No variables available to plot for success-case.")
+        return
+    if sample_path is None:
+        logging.warning("No file path available for success-case plot.")
+        return
+
+    try:
+        plot_data = read_file(str(sample_path), variables=variables, tilt_last=True)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to load success-case sample %s: %s", sample_path, exc)
+        return
+
+    time_len = plot_data[variables[0]].shape[0]
+    time_idx = max(0, time_len - 1)
+    n_tilts = plot_data[variables[0]].shape[-1] if plot_data[variables[0]].ndim >= 3 else 1
+    chosen_tilt = max(0, min(n_tilts - 1, 0))
+    sweep_idx = [chosen_tilt] * len(variables)
+    n_rows, n_cols = _grid_for_channels(len(variables))
+
+    fig = plt.figure(figsize=(12, 6), edgecolor="k")
+    plot_radar(
+        plot_data,
+        channels=list(variables),
+        fig=fig,
+        time_idx=time_idx,
+        sweep_idx=sweep_idx,
+        include_cbar=True,
+        n_rows=n_rows,
+        n_cols=n_cols,
+    )
+    fig.suptitle(f"{label} | frame {time_idx}", y=0.98)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"success_case_{label}.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    logging.info("Saved metric plot to %s", out_path)
+    logging.info("Saved success-case plot to %s", out_path)
 
 
 def main():
@@ -719,6 +858,11 @@ def main():
     total_count = 0
     false_catalog = {"false_positives": [], "false_negatives": []} if can_catalog else None
     sample_index = 0
+    all_probs: List[torch.Tensor] = []
+    all_labels: List[torch.Tensor] = []
+    success_path: Path | None = None
+    success_prob = -1.0
+    success_label = "success"
 
     with torch.no_grad():
         for batch in ds:
@@ -735,11 +879,24 @@ def main():
             total_loss += loss.item() * labels.shape[0]
             total_count += labels.shape[0]
             probs = torch.sigmoid(logits[:, 1])
+            preds = (probs >= 0.5).long()
             metric_collection.update(probs, labels)
             stat_scores.update(probs, labels)
+            all_probs.append(probs.detach().cpu())
+            all_labels.append(labels.detach().cpu())
+            batch_size = labels.shape[0]
+            if file_list:
+                matches = ((preds == 1) & (labels == 1)).nonzero(as_tuple=False)
+                if matches.numel() > 0:
+                    match_probs = probs[matches.squeeze(1)]
+                    best_idx = int(match_probs.argmax().item())
+                    idx = int(matches[best_idx].item())
+                    best_prob = float(match_probs[best_idx].item())
+                    if best_prob > success_prob:
+                        success_prob = best_prob
+                        success_path = Path(file_list[sample_index + idx])
+                        success_label = _safe_filename(file_list, sample_index + idx)
             if false_catalog:
-                batch_size = labels.shape[0]
-                preds = (probs >= 0.5).long()
                 for i in range(batch_size):
                     idx = sample_index + i
                     if idx >= len(file_list):  # type: ignore[arg-type]
@@ -756,7 +913,7 @@ def main():
                         false_catalog["false_negatives"].append(
                             {"file": path, "prob": prob, "label": label, "pred": pred}
                         )
-                sample_index += batch_size
+            sample_index += batch_size
 
     metrics = metric_collection.compute()
     tp, fp, tn, fn, _ = (s.item() for s in stat_scores.compute())
@@ -767,7 +924,12 @@ def main():
         metrics["CSI"] = csi
     logging.info("Evaluation metrics: %s", metrics)
     eval_out_dir = checkpoint_path.resolve().parent.parent
-    _plot_metric_summary(metrics, eval_out_dir)
+    if all_probs and all_labels:
+        probs_all = torch.cat(all_probs)
+        labels_all = torch.cat(all_labels)
+        _plot_metric_curves(metrics, probs_all, labels_all, eval_out_dir)
+    if success_path is not None:
+        _plot_success_case(success_path, input_variables, eval_out_dir, success_label)
     if false_catalog:
         out_path = eval_out_dir / "false_cases.json"
         with open(out_path, "w") as f:
