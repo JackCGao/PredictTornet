@@ -434,6 +434,40 @@ def _generate_grad_cam_plots(
     logging.info("Saved %d Grad-CAM sample(s) to %s", saved, out_dir)
 
 
+def _plot_metric_summary(metrics: Dict[str, float], out_dir: Path, model_label: str = "TorSight"):
+    if plt is None:  # pragma: no cover - optional dependency
+        logging.warning("matplotlib unavailable; skipping metric plot.")
+        return
+    targets = [("CSI", "CSI"), ("AUC", "AUC"), ("AUCPR", "AUCPD")]
+    entries = [(label, float(metrics[key])) for key, label in targets if key in metrics]
+    if not entries:
+        logging.warning("No metrics available for plotting; skipping metric plot.")
+        return
+
+    labels, values = zip(*entries)
+    x = np.arange(len(labels))
+    width = 0.6
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    bars = ax.bar(x, values, width, color="#1f77b4")
+    ax.set_ylim(0, 1.05)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Score")
+    ax.set_title("TorSight Evaluation Metrics")
+    ax.legend([bars[0]], [model_label], title="Model")
+
+    for bar, val in zip(bars, values):
+        ax.annotate(f"{val:.3f}", xy=(bar.get_x() + bar.get_width() / 2, val), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=8)
+
+    fig.tight_layout()
+    out_path = out_dir / "torsight_metrics.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    logging.info("Saved metric plot to %s", out_path)
+
+
 def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
@@ -559,9 +593,10 @@ def main():
     if csi is not None:
         metrics["CSI"] = csi
     logging.info("Evaluation metrics: %s", metrics)
+    eval_out_dir = checkpoint_path.resolve().parent.parent
+    _plot_metric_summary(metrics, eval_out_dir)
     if false_catalog:
-        out_dir = checkpoint_path.resolve().parent.parent
-        out_path = out_dir / "false_cases.json"
+        out_path = eval_out_dir / "false_cases.json"
         with open(out_path, "w") as f:
             json.dump(false_catalog, f, indent=2)
         logging.info(
