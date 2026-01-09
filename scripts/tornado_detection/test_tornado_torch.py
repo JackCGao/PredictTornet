@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -92,8 +93,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--optuna-study",
-        default="tornet_optuna",
-        help="Optuna study name (default: tornet_optuna).",
+        default="*",
+        help=(
+            "Optuna study name(s) to consider (comma-separated). "
+            "Use '*' to search all studies in the storage (default: '*')."
+        ),
     )
     parser.add_argument(
         "--grad-cam",
@@ -220,17 +224,160 @@ def _load_training_config(checkpoint_path: Path) -> Dict[str, Any]:
 
 
 def _load_best_optuna_params(storage: str, study_name: str) -> Dict[str, Any]:
-    """Load best trial parameters from an Optuna study."""
+    """Load best trial parameters from one or more Optuna studies."""
 
     try:
         import optuna
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise SystemExit("optuna is required to load best trial params. Install with `pip install optuna`.") from exc
 
-    study = optuna.load_study(study_name=study_name, storage=storage)
-    best = study.best_trial
-    logging.info("Loaded best Optuna trial %s (value=%s)", best.number, best.value)
+    study_filter = [s.strip() for s in study_name.split(",") if s.strip()]
+    use_all = not study_filter or any(s in {"*", "any", "all"} for s in study_filter)
+    use_first = any(s in {"first"} for s in study_filter)
+    if use_all:
+        study_filter = []
+
+    summaries = optuna.study.get_all_study_summaries(storage=storage)
+    if not summaries:
+        raise SystemExit(f"No Optuna studies found in storage {storage}.")
+    if use_first:
+        summaries = [
+            min(
+                summaries,
+                key=lambda s: getattr(s, "study_id", getattr(s, "_study_id", 0)),
+            )
+        ]
+        study_filter = []
+
+    candidates: List[Tuple[float, str, Any]] = []
+    for summary in summaries:
+        if study_filter and summary.study_name not in study_filter:
+            continue
+        study = optuna.load_study(study_name=summary.study_name, storage=storage)
+        if len(study.directions) > 1:
+            if not study.best_trials:
+                continue
+            best = max(study.best_trials, key=lambda t: t.values[0])
+            best_value = best.values[0]
+            direction = study.directions[0]
+        else:
+            best = study.best_trial
+            best_value = best.value
+            direction = study.direction
+        if best_value is None or not math.isfinite(float(best_value)):
+            continue
+        score = float(best_value)
+        if direction == optuna.study.StudyDirection.MINIMIZE:
+            score = -score
+        candidates.append((score, summary.study_name, best))
+
+    if not candidates:
+        raise SystemExit("No usable Optuna trials found for evaluation.")
+
+    _, study_name, best = max(candidates, key=lambda item: item[0])
+    best_value = best.values[0] if getattr(best, "values", None) else best.value
+    logging.info(
+        "Loaded best Optuna trial %s from study '%s' (value=%s)",
+        best.number,
+        study_name,
+        best_value,
+    )
     return dict(best.params)
+
+
+def _normalize_optuna_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert Optuna parameter names into training config keys when needed."""
+
+    normalized = dict(params)
+    conv_keys = [k for k in params if k.startswith("convs_block")]
+    if conv_keys:
+        convs_per_block = []
+        for idx in range(1, 5):
+            key = f"convs_block{idx}"
+            if key in params:
+                convs_per_block.append(int(params[key]))
+        if convs_per_block:
+            normalized["convs_per_block"] = convs_per_block
+        for key in conv_keys:
+            normalized.pop(key, None)
+    return normalized
+
+
+def _values_match(expected: Any, actual: Any) -> bool:
+    if isinstance(expected, (list, tuple)) or isinstance(actual, (list, tuple)):
+        expected_list = list(expected) if isinstance(expected, (list, tuple)) else [expected]
+        actual_list = list(actual) if isinstance(actual, (list, tuple)) else [actual]
+        if len(expected_list) != len(actual_list):
+            return False
+        return all(_values_match(e, a) for e, a in zip(expected_list, actual_list))
+    if isinstance(expected, (int, float)) or isinstance(actual, (int, float)):
+        try:
+            return math.isclose(float(expected), float(actual), rel_tol=1e-6, abs_tol=1e-8)
+        except (TypeError, ValueError):
+            return False
+    return expected == actual
+
+
+def _config_matches_params(config: Dict[str, Any], params: Dict[str, Any]) -> bool:
+    for key, value in params.items():
+        if key not in config:
+            return False
+        if not _values_match(config[key], value):
+            return False
+    return True
+
+
+def _log_config_parity(config: Dict[str, Any], params: Dict[str, Any]) -> None:
+    mismatches = []
+    for key, value in params.items():
+        if key not in config:
+            mismatches.append((key, value, "<missing>"))
+            continue
+        if not _values_match(config[key], value):
+            mismatches.append((key, value, config[key]))
+    if mismatches:
+        logging.warning("Optuna params do not fully match training config:")
+        for key, expected, actual in mismatches:
+            logging.warning("  %s: optuna=%s config=%s", key, expected, actual)
+    else:
+        logging.info("Optuna params match training config.")
+
+
+def _find_checkpoint_in_expdir(exp_dir: Path) -> Path | None:
+    ckpt_dir = exp_dir / "checkpoints"
+    if not ckpt_dir.exists():
+        return None
+    ckpts = sorted(ckpt_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not ckpts:
+        return None
+    non_last = [p for p in ckpts if p.name != "last.ckpt"]
+    return non_last[0] if non_last else ckpts[0]
+
+
+def _find_optuna_checkpoint(best_params: Dict[str, Any], exp_root: Path) -> Path | None:
+    """Find the checkpoint directory whose params.json matches the best Optuna params."""
+
+    candidates: List[Path] = []
+    if exp_root.exists():
+        candidates.extend([p for p in exp_root.iterdir() if p.is_dir()])
+
+    for exp_dir in candidates:
+        params_path = exp_dir / "params.json"
+        if not params_path.exists():
+            continue
+        try:
+            payload = json.loads(params_path.read_text())
+        except Exception:  # noqa: BLE001
+            continue
+        config = payload.get("config", payload) if isinstance(payload, dict) else {}
+        if not isinstance(config, dict):
+            continue
+        if not _config_matches_params(config, best_params):
+            continue
+        checkpoint = _find_checkpoint_in_expdir(exp_dir)
+        if checkpoint:
+            return checkpoint
+    return None
 
 def _drop_missing_files(loader: DataLoader, loader_name: str) -> None:
     """
@@ -444,6 +591,24 @@ def main():
         logging.info("Using TFDS dataset at %s", os.environ["TFDS_DATA_DIR"])
 
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else _find_default_checkpoint()
+    if args.use_best_optuna:
+        best_params = _normalize_optuna_params(
+            _load_best_optuna_params(args.optuna_storage, args.optuna_study)
+        )
+        exp_root = Path(os.environ.get("EXP_DIR", ".")).resolve()
+        optuna_checkpoint = _find_optuna_checkpoint(best_params, exp_root)
+        if optuna_checkpoint is None:
+            raise RuntimeError(
+                "Could not locate a checkpoint for the best Optuna trial. "
+                "Ensure experiment directories exist under EXP_DIR or pass --checkpoint."
+            )
+        if args.checkpoint:
+            logging.warning(
+                "Overriding --checkpoint with best Optuna checkpoint: %s",
+                optuna_checkpoint,
+            )
+        checkpoint_path = optuna_checkpoint
+
     if not checkpoint_path or not checkpoint_path.exists():
         raise RuntimeError(
             "No checkpoint provided and no default checkpoint found. "
@@ -451,8 +616,8 @@ def main():
         )
     train_cfg = _load_training_config(checkpoint_path)
     if args.use_best_optuna:
-        best_params = _load_best_optuna_params(args.optuna_storage, args.optuna_study)
         train_cfg.update(best_params)
+        _log_config_parity(train_cfg, best_params)
 
     input_variables = train_cfg.get("input_variables", ALL_VARIABLES)
     dataloader_kwargs_cfg = train_cfg.get("dataloader_kwargs", {})
@@ -488,6 +653,10 @@ def main():
     include_range_folded = args.include_range_folded or "range_folded_mask" in sample_batch
 
     start_filters = int(train_cfg.get("start_filters", 48))
+    kernel_size = int(train_cfg.get("kernel_size", 3))
+    n_blocks = int(train_cfg.get("n_blocks", 4))
+    convs_per_block = train_cfg.get("convs_per_block")
+    drop_rate = float(train_cfg.get("drop_rate", 0.1))
 
     likelihood = TornadoLikelihood(
         shape=input_shape,
@@ -495,6 +664,10 @@ def main():
         input_variables=input_variables,
         include_range_folded=include_range_folded,
         start_filters=start_filters,
+        kernel_size=kernel_size,
+        n_blocks=n_blocks,
+        convs_per_block=convs_per_block,
+        drop_rate=drop_rate,
     )
     classifier = TornadoClassifier(
         model=likelihood,
