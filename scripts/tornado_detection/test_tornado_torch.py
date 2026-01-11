@@ -794,12 +794,17 @@ def main():
 
     input_variables = train_cfg.get("input_variables", ALL_VARIABLES)
     dataloader_kwargs_cfg = train_cfg.get("dataloader_kwargs", {})
+    select_keys = train_cfg.get(
+        "dataloader_keys",
+        input_variables + ["range_folded_mask", "coordinates"],
+    )
+    if select_keys is not None:
+        select_keys = list(select_keys)
+        if "ef_number" not in select_keys:
+            select_keys.append("ef_number")
     dataloader_kwargs = {
         "tilt_last": dataloader_kwargs_cfg.get("tilt_last", args.tilt_last),
-        "select_keys": train_cfg.get(
-            "dataloader_keys",
-            input_variables + ["range_folded_mask", "coordinates"],
-        ),
+        "select_keys": select_keys,
     }
     weights = None
     batch_size = int(train_cfg.get("batch_size", args.batch_size))
@@ -862,6 +867,7 @@ def main():
     all_labels: List[torch.Tensor] = []
     success_path: Path | None = None
     success_prob = -1.0
+    success_ef = -1.0
     success_label = "success"
 
     with torch.no_grad():
@@ -885,17 +891,38 @@ def main():
             all_probs.append(probs.detach().cpu())
             all_labels.append(labels.detach().cpu())
             batch_size = labels.shape[0]
-            if file_list:
-                matches = ((preds == 1) & (labels == 1)).nonzero(as_tuple=False)
-                if matches.numel() > 0:
-                    match_probs = probs[matches.squeeze(1)]
-                    best_idx = int(match_probs.argmax().item())
-                    idx = int(matches[best_idx].item())
-                    best_prob = float(match_probs[best_idx].item())
-                    if best_prob > success_prob:
-                        success_prob = best_prob
-                        success_path = Path(file_list[sample_index + idx])
-                        success_label = _safe_filename(file_list, sample_index + idx)
+            if file_list and "ef_number" in batch:
+                ef_values = batch.get("ef_number")
+                if ef_values is not None:
+                    ef_flat = torch.as_tensor(ef_values).detach().cpu().view(-1)
+                    matches = ((preds == 1) & (labels == 1)).nonzero(as_tuple=False)
+                    if matches.numel() > 0:
+                        match_idx = matches.squeeze(1)
+                        match_probs = probs[match_idx].detach().cpu()
+                        match_ef = ef_flat[match_idx]
+                        valid_mask = match_ef >= 0
+                        if valid_mask.any():
+                            match_probs = match_probs[valid_mask]
+                            match_ef = match_ef[valid_mask]
+                            match_idx = match_idx[valid_mask]
+                        # Pick highest EF, break ties with probability
+                        best_local = None
+                        for ef_val, prob_val, idx_val in zip(
+                            match_ef.tolist(), match_probs.tolist(), match_idx.tolist()
+                        ):
+                            if best_local is None:
+                                best_local = (ef_val, prob_val, idx_val)
+                                continue
+                            if ef_val > best_local[0] or (math.isclose(ef_val, best_local[0]) and prob_val > best_local[1]):
+                                best_local = (ef_val, prob_val, idx_val)
+                        if best_local:
+                            ef_val, prob_val, idx_val = best_local
+                            global_idx = sample_index + int(idx_val)
+                            if ef_val > success_ef or (math.isclose(ef_val, success_ef) and prob_val > success_prob):
+                                success_ef = ef_val
+                                success_prob = prob_val
+                                success_path = Path(file_list[global_idx])
+                                success_label = f"{_safe_filename(file_list, global_idx)}_EF{int(ef_val)}"
             if false_catalog:
                 for i in range(batch_size):
                     idx = sample_index + i
