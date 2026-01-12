@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover
 import numpy as np
 import torch
 import torch.nn.functional as F
+import xarray as xr
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
 from torchmetrics import MetricCollection
@@ -47,6 +48,7 @@ from tornet.models.torch.cnn_baseline import TornadoClassifier, TornadoLikelihoo
 logging.basicConfig(level=logging.INFO)
 
 DATA_ROOT = os.environ["TORNET_ROOT"]
+DATA_ROOT_PATH = Path(DATA_ROOT)
 logging.info("TORNET_ROOT=%s", DATA_ROOT)
 
 
@@ -114,16 +116,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "Use '*' to search all studies in the storage (default: '*')."
         ),
     )
-    parser.add_argument(
+    grad_cam_group = parser.add_mutually_exclusive_group()
+    grad_cam_group.add_argument(
         "--grad-cam",
         action="store_true",
-        help="If set, generate Grad-CAM plots for a subset of samples.",
+        default=True,
+        help="Generate Grad-CAM plots for a subset of samples (default: enabled).",
+    )
+    grad_cam_group.add_argument(
+        "--no-grad-cam",
+        dest="grad_cam",
+        action="store_false",
+        help="Disable Grad-CAM plots.",
     )
     parser.add_argument(
         "--grad-cam-output",
         type=Path,
-        default=Path("grad_cam"),
-        help="Directory to save Grad-CAM plots (default: grad_cam).",
+        default=None,
+        help="Directory to save Grad-CAM plots (default: eval output directory).",
     )
     parser.add_argument(
         "--grad-cam-samples",
@@ -136,6 +146,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Tilt index to plot when rendering Grad-CAM (default: 0).",
+    )
+    parser.add_argument(
+        "--non-retagged-root",
+        type=Path,
+        default=DATA_ROOT_PATH.parent / "tornet_raw",
+        help=(
+            "Root directory for non-retagged Tornet files to plot the actual labeled "
+            "signature for the success-case sample."
+        ),
     )
     return parser
 
@@ -485,6 +504,92 @@ def _safe_filename(file_list: List[str] | None, idx: int) -> str:
         return Path(file_list[idx]).with_suffix("").name
     return f"sample_{idx}"
 
+def _map_to_non_retagged(
+    sample_path: Path,
+    non_retagged_root: Path,
+    retagged_root: Path | None,
+) -> Path | None:
+    if retagged_root is not None:
+        try:
+            rel_path = sample_path.relative_to(retagged_root)
+        except ValueError:
+            rel_path = None
+        if rel_path is not None:
+            candidate = non_retagged_root / rel_path
+            if candidate.exists():
+                return candidate
+
+    matches = sorted(non_retagged_root.rglob(sample_path.name))
+    if matches:
+        if len(matches) > 1:
+            logging.warning(
+                "Multiple non-retagged matches for %s; using %s",
+                sample_path.name,
+                matches[0],
+            )
+        return matches[0]
+    return None
+
+def _find_tornadic_time_index(sample_path: Path) -> int | None:
+    try:
+        with xr.open_dataset(sample_path) as ds:
+            if "frame_labels" not in ds:
+                return None
+            labels = ds["frame_labels"].values
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to read frame_labels from %s: %s", sample_path, exc)
+        return None
+    positive = np.where(labels == 1)[0]
+    if positive.size == 0:
+        return None
+    return int(positive[-1])
+
+def _load_plot_data(
+    sample_path: Path,
+    variables: List[str],
+    time_idx: int,
+    tilt_last: bool = True,
+) -> Dict[str, np.ndarray]:
+    data: Dict[str, np.ndarray] = {}
+    with xr.open_dataset(sample_path) as ds:
+        for v in variables:
+            if v not in ds:
+                continue
+            arr = ds[v].isel(time=time_idx).values
+            arr = arr[None, ...]
+            if not tilt_last and arr.ndim == 4:
+                arr = np.transpose(arr, (0, 3, 1, 2))
+            data[v] = arr
+        if "time" in ds:
+            data["time"] = np.array([np.int64(ds["time"].values[time_idx])])
+        if "azimuth_limits" in ds:
+            data["az_lower"] = np.array(ds["azimuth_limits"].values[0:1])
+            data["az_upper"] = np.array(ds["azimuth_limits"].values[1:])
+        if "range_limits" in ds:
+            data["rng_lower"] = np.array(ds["range_limits"].values[0:1])
+            data["rng_upper"] = np.array(ds["range_limits"].values[1:])
+        data["event_id"] = np.array([int(ds.attrs.get("event_id", -1))], dtype=np.int64)
+        data["ef_number"] = np.array([int(ds.attrs.get("ef_number", -1))], dtype=np.int64)
+    return data
+
+def _load_plot_metadata(sample_path: Path) -> Dict[str, np.ndarray]:
+    data: Dict[str, np.ndarray] = {}
+    try:
+        with xr.open_dataset(sample_path) as ds:
+            if "time" in ds:
+                data["time"] = np.array([np.int64(ds["time"].values[-1])])
+            if "azimuth_limits" in ds:
+                data["az_lower"] = np.array(ds["azimuth_limits"].values[0:1])
+                data["az_upper"] = np.array(ds["azimuth_limits"].values[1:])
+            if "range_limits" in ds:
+                data["rng_lower"] = np.array(ds["range_limits"].values[0:1])
+                data["rng_upper"] = np.array(ds["range_limits"].values[1:])
+            data["event_id"] = np.array([int(ds.attrs.get("event_id", -1))], dtype=np.int64)
+            data["ef_number"] = np.array([int(ds.attrs.get("ef_number", -1))], dtype=np.int64)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to load plot metadata from %s: %s", sample_path, exc)
+    return data
+
 def _grid_for_channels(n_channels: int) -> Tuple[int, int]:
     if n_channels <= 3:
         return (1, n_channels)
@@ -501,6 +606,15 @@ def _prepare_plot_sample(
     """Format a single sample for plot_radar (tilt-last with time dim)."""
 
     data: Dict[str, np.ndarray] = {}
+    required_keys = {
+        "event_id",
+        "ef_number",
+        "time",
+        "az_lower",
+        "az_upper",
+        "rng_lower",
+        "rng_upper",
+    }
     for key, value in batch.items():
         if not torch.is_tensor(value):
             continue
@@ -521,6 +635,17 @@ def _prepare_plot_sample(
             data[key] = np.array([arr])
         else:
             data[key] = arr
+
+    missing = required_keys.difference(data.keys())
+    for key in missing:
+        if key in {"az_lower", "rng_lower"}:
+            data[key] = np.array([0.0], dtype=np.float64)
+        elif key == "az_upper":
+            data[key] = np.array([360.0], dtype=np.float64)
+        elif key == "rng_upper":
+            data[key] = np.array([1.0], dtype=np.float64)
+        else:
+            data[key] = np.array([-1], dtype=np.int64)
     return data
 
 
@@ -534,17 +659,18 @@ def _generate_grad_cam_plots(
     file_list: List[str] | None,
     tilt_index: int,
     device: torch.device,
+    non_retagged_root: Path,
+    retagged_root: Path | None,
 ):
     if plt is None:  # pragma: no cover - optional dependency
-        logging.warning("matplotlib unavailable; skipping Grad-CAM plots.")
+        logging.warning("matplotlib unavailable; skipping likelihood plots.")
         return
     try:
-        from tornet.display.display import plot_radar
+        from tornet.display.display import get_cmap
     except Exception as exc:  # pragma: no cover - optional dependency
-        logging.warning("tornet.display.display unavailable; skipping Grad-CAM plots: %s", exc)
+        logging.warning("tornet.display.display unavailable; skipping likelihood plots: %s", exc)
         return
 
-    grad_cam = _GradCAM(classifier.model.head[-1])
     saved = 0
     sample_index = 0
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -557,53 +683,75 @@ def _generate_grad_cam_plots(
         batch.pop("label", None)
         batch.pop("sample_weights", None)
 
-        grad_cam.clear()
-        classifier.zero_grad(set_to_none=True)
-        with torch.enable_grad():
+        with torch.no_grad():
             logits = classifier.model(batch)
-            pooled = F.max_pool2d(logits, kernel_size=logits.size()[2:])
-            score = torch.squeeze(pooled)
-            if score.ndim == 0:
-                score = score.unsqueeze(0)
-            score.sum().backward()
-            cams = grad_cam.build_cam().detach().cpu()
+            probs = torch.sigmoid(logits).detach().cpu()
 
-        batch_size = cams.shape[0]
+        batch_size = probs.shape[0]
         for i in range(batch_size):
             if saved >= max_samples:
                 break
             plot_data = _prepare_plot_sample(batch_for_plot, i, variables, tilt_last)
-            cam_np = cams[i].numpy()
-            plot_data["cnn_output"] = cam_np[None, ..., None]
+            if file_list is not None:
+                file_idx = sample_index + i
+                if 0 <= file_idx < len(file_list):
+                    source_path = Path(file_list[file_idx])
+                    meta_path = _map_to_non_retagged(
+                        source_path, non_retagged_root, retagged_root
+                    ) or source_path
+                    plot_data.update(_load_plot_metadata(meta_path))
+            if not variables:
+                logging.warning("No variables available for Grad-CAM plotting.")
+                continue
+
+            var_shape = plot_data[variables[0]].shape if variables else None
+            if not var_shape or len(var_shape) < 3:
+                logging.warning("Unexpected variable shape for likelihood plot: %s", var_shape)
+                continue
+
+            target_h = var_shape[1]
+            target_w = var_shape[2]
+            prob_tensor = probs[i].unsqueeze(0)
+            prob_resized = F.interpolate(
+                prob_tensor,
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+            )[0, 0]
+            plot_data["cnn_output"] = prob_resized.numpy()[None, ..., None]
             file_tag = _safe_filename(file_list, sample_index + i)
 
-            tilt_for_plot = 0
-            var_shape = plot_data[variables[0]].shape if variables else None
-            if var_shape and len(var_shape) == 4:
-                tilt_for_plot = min(max(tilt_index, 0), max(var_shape[-1] - 1, 0))
+            az_lower = float(np.asarray(plot_data.get("az_lower", [0.0]))[0])
+            az_upper = float(np.asarray(plot_data.get("az_upper", [360.0]))[0])
+            rng_lower = float(np.asarray(plot_data.get("rng_lower", [0.0]))[0]) / 1e3
+            rng_upper = float(np.asarray(plot_data.get("rng_upper", [1.0]))[0]) / 1e3
+            if az_upper <= az_lower:
+                az_lower, az_upper = 0.0, 360.0
+            if rng_upper <= rng_lower:
+                rng_lower, rng_upper = 0.0, 1.0
 
-            for var in variables:
-                fig = plt.figure(figsize=(10, 4), edgecolor="k")
-                plot_radar(
-                    plot_data,
-                    channels=[var, "cnn_output"],
-                    fig=fig,
-                    time_idx=0,
-                    sweep_idx=[tilt_for_plot, 0],
-                    include_cbar=True,
-                    n_rows=1,
-                    n_cols=2,
-                )
-                fig.suptitle(f"{file_tag} | {var}", y=0.98)
-                fig.tight_layout(rect=[0, 0, 1, 0.96])
-                out_path = out_dir / f"{file_tag}_{var}_gradcam.png"
-                fig.savefig(out_path, dpi=150)
-                plt.close(fig)
+            cmap, norm = get_cmap("cnn_output")
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.imshow(
+                plot_data["cnn_output"][0, ..., 0],
+                origin="lower",
+                aspect="auto",
+                extent=[rng_lower, rng_upper, az_lower, az_upper],
+                cmap=cmap,
+                norm=norm,
+            )
+            ax.set_xlabel("Range (km)")
+            ax.set_ylabel("Azimuth (deg)")
+            ax.set_title(f"{file_tag} | Tornado Likelihood")
+            fig.colorbar(ax.images[0], ax=ax, shrink=0.8, label="Likelihood")
+            fig.tight_layout()
+            out_path = out_dir / f"{file_tag}_likelihood.png"
+            fig.savefig(out_path, dpi=150)
+            plt.close(fig)
             saved += 1
         sample_index += batch_size
 
-    grad_cam.remove()
-    logging.info("Saved %d Grad-CAM sample(s) to %s", saved, out_dir)
+    logging.info("Saved %d likelihood map sample(s) to %s", saved, out_dir)
 
 
 def _plot_metric_curves(
@@ -703,6 +851,8 @@ def _plot_success_case(
     variables: List[str],
     out_dir: Path,
     label: str,
+    non_retagged_root: Path,
+    retagged_root: Path | None = None,
 ):
     if plt is None:  # pragma: no cover - optional dependency
         logging.warning("matplotlib unavailable; skipping success-case plot.")
@@ -720,38 +870,97 @@ def _plot_success_case(
         logging.warning("No file path available for success-case plot.")
         return
 
-    try:
-        plot_data = read_file(str(sample_path), variables=variables, tilt_last=True)
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("Failed to load success-case sample %s: %s", sample_path, exc)
+    def _plot_from_data(
+        plot_data: Dict[str, np.ndarray],
+        filename_suffix: str,
+        title_suffix: str,
+        frame_idx: int,
+    ) -> None:
+        n_tilts = plot_data[variables[0]].shape[-1] if plot_data[variables[0]].ndim >= 3 else 1
+        chosen_tilt = max(0, min(n_tilts - 1, 0))
+        sweep_idx = [chosen_tilt] * len(variables)
+        n_rows, n_cols = _grid_for_channels(len(variables))
+
+        fig = plt.figure(figsize=(12, 6), edgecolor="k")
+        plot_radar(
+            plot_data,
+            channels=list(variables),
+            fig=fig,
+            time_idx=0,
+            sweep_idx=sweep_idx,
+            include_cbar=True,
+            n_rows=n_rows,
+            n_cols=n_cols,
+        )
+        fig.suptitle(f"{label}{title_suffix} | frame {frame_idx}", y=0.98)
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"success_case_{label}{filename_suffix}.png"
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        logging.info("Saved success-case plot to %s", out_path)
+
+    if not non_retagged_root.exists():
+        logging.warning("Non-retagged root does not exist: %s", non_retagged_root)
         return
 
-    time_len = plot_data[variables[0]].shape[0]
-    time_idx = max(0, time_len - 1)
-    n_tilts = plot_data[variables[0]].shape[-1] if plot_data[variables[0]].ndim >= 3 else 1
-    chosen_tilt = max(0, min(n_tilts - 1, 0))
-    sweep_idx = [chosen_tilt] * len(variables)
-    n_rows, n_cols = _grid_for_channels(len(variables))
+    non_retagged_path = _map_to_non_retagged(sample_path, non_retagged_root, retagged_root)
+    if non_retagged_path is None:
+        logging.warning("No non-retagged match found for %s", sample_path)
+        non_retagged_path = None
 
-    fig = plt.figure(figsize=(12, 6), edgecolor="k")
-    plot_radar(
-        plot_data,
-        channels=list(variables),
-        fig=fig,
-        time_idx=time_idx,
-        sweep_idx=sweep_idx,
-        include_cbar=True,
-        n_rows=n_rows,
-        n_cols=n_cols,
-    )
-    fig.suptitle(f"{label} | frame {time_idx}", y=0.98)
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    torn_time_idx = None
+    if non_retagged_path is not None:
+        torn_time_idx = _find_tornadic_time_index(non_retagged_path)
+        if torn_time_idx is None:
+            logging.warning("No tornadic frame_labels found in %s", non_retagged_path)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"success_case_{label}.png"
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    logging.info("Saved success-case plot to %s", out_path)
+    if non_retagged_path is not None and torn_time_idx is not None:
+        pre_time_idx = max(0, torn_time_idx - 1)
+        try:
+            pre_data = _load_plot_data(
+                non_retagged_path,
+                variables,
+                pre_time_idx,
+                tilt_last=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to load pre-tornadic slice from %s: %s", non_retagged_path, exc)
+            pre_data = {}
+        if pre_data:
+            _plot_from_data(pre_data, "", " (pre-tornadic)", pre_time_idx)
+        else:
+            logging.warning("No variables available for pre-tornadic plot from %s", non_retagged_path)
+    else:
+        try:
+            fallback_data = read_file(str(sample_path), variables=variables, tilt_last=True)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to load success-case sample %s: %s", sample_path, exc)
+            return
+        time_len = fallback_data[variables[0]].shape[0]
+        time_idx = max(0, time_len - 1)
+        _plot_from_data(fallback_data, "", "", time_idx)
+
+    if non_retagged_path is None or torn_time_idx is None:
+        return
+
+    try:
+        plot_data = _load_plot_data(
+            non_retagged_path,
+            variables,
+            torn_time_idx,
+            tilt_last=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to load tornadic slice from %s: %s", non_retagged_path, exc)
+        return
+
+    if not plot_data:
+        logging.warning("No variables available to plot for %s", non_retagged_path)
+        return
+
+    _plot_from_data(plot_data, "_actual", " (actual)", torn_time_idx)
 
 
 def main():
@@ -869,6 +1078,10 @@ def main():
     success_prob = -1.0
     success_ef = -1.0
     success_label = "success"
+    weak_success_path: Path | None = None
+    weak_success_prob = float("inf")
+    weak_success_ef = float("inf")
+    weak_success_label = "weak_success"
 
     with torch.no_grad():
         for batch in ds:
@@ -898,23 +1111,28 @@ def main():
                     matches = ((preds == 1) & (labels == 1)).nonzero(as_tuple=False)
                     if matches.numel() > 0:
                         match_idx = matches.squeeze(1)
+                        match_idx_cpu = match_idx.detach().cpu()
                         match_probs = probs[match_idx].detach().cpu()
-                        match_ef = ef_flat[match_idx]
+                        match_ef = ef_flat[match_idx_cpu]
                         valid_mask = match_ef >= 0
                         if valid_mask.any():
                             match_probs = match_probs[valid_mask]
                             match_ef = match_ef[valid_mask]
-                            match_idx = match_idx[valid_mask]
+                            match_idx_cpu = match_idx_cpu[valid_mask]
                         # Pick highest EF, break ties with probability
                         best_local = None
+                        worst_local = None
                         for ef_val, prob_val, idx_val in zip(
-                            match_ef.tolist(), match_probs.tolist(), match_idx.tolist()
+                            match_ef.tolist(), match_probs.tolist(), match_idx_cpu.tolist()
                         ):
                             if best_local is None:
                                 best_local = (ef_val, prob_val, idx_val)
+                                worst_local = (ef_val, prob_val, idx_val)
                                 continue
                             if ef_val > best_local[0] or (math.isclose(ef_val, best_local[0]) and prob_val > best_local[1]):
                                 best_local = (ef_val, prob_val, idx_val)
+                            if ef_val < worst_local[0] or (math.isclose(ef_val, worst_local[0]) and prob_val < worst_local[1]):
+                                worst_local = (ef_val, prob_val, idx_val)
                         if best_local:
                             ef_val, prob_val, idx_val = best_local
                             global_idx = sample_index + int(idx_val)
@@ -923,6 +1141,14 @@ def main():
                                 success_prob = prob_val
                                 success_path = Path(file_list[global_idx])
                                 success_label = f"{_safe_filename(file_list, global_idx)}_EF{int(ef_val)}"
+                        if worst_local:
+                            ef_val, prob_val, idx_val = worst_local
+                            global_idx = sample_index + int(idx_val)
+                            if ef_val < weak_success_ef or (math.isclose(ef_val, weak_success_ef) and prob_val < weak_success_prob):
+                                weak_success_ef = ef_val
+                                weak_success_prob = prob_val
+                                weak_success_path = Path(file_list[global_idx])
+                                weak_success_label = f"{_safe_filename(file_list, global_idx)}_EF{int(ef_val)}_weak"
             if false_catalog:
                 for i in range(batch_size):
                     idx = sample_index + i
@@ -956,7 +1182,23 @@ def main():
         labels_all = torch.cat(all_labels)
         _plot_metric_curves(metrics, probs_all, labels_all, eval_out_dir)
     if success_path is not None:
-        _plot_success_case(success_path, input_variables, eval_out_dir, success_label)
+        _plot_success_case(
+            success_path,
+            input_variables,
+            eval_out_dir,
+            success_label,
+            non_retagged_root=args.non_retagged_root,
+            retagged_root=DATA_ROOT_PATH,
+        )
+    if weak_success_path is not None:
+        _plot_success_case(
+            weak_success_path,
+            input_variables,
+            eval_out_dir,
+            weak_success_label,
+            non_retagged_root=args.non_retagged_root,
+            retagged_root=DATA_ROOT_PATH,
+        )
     if false_catalog:
         out_path = eval_out_dir / "false_cases.json"
         with open(out_path, "w") as f:
@@ -968,16 +1210,19 @@ def main():
             out_path,
         )
     if args.grad_cam:
+        grad_cam_out_dir = args.grad_cam_output or eval_out_dir
         _generate_grad_cam_plots(
             classifier=classifier,
             loader=ds,
             variables=input_variables,
             tilt_last=dataloader_kwargs["tilt_last"],
-            out_dir=args.grad_cam_output,
+            out_dir=grad_cam_out_dir,
             max_samples=args.grad_cam_samples,
             file_list=file_list,
             tilt_index=args.grad_cam_tilt_index,
             device=device,
+            non_retagged_root=args.non_retagged_root,
+            retagged_root=DATA_ROOT_PATH,
         )
 
 
