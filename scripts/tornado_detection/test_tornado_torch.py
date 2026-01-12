@@ -853,6 +853,7 @@ def _plot_success_case(
     label: str,
     non_retagged_root: Path,
     retagged_root: Path | None = None,
+    file_tag: str | None = None,
 ):
     if plt is None:  # pragma: no cover - optional dependency
         logging.warning("matplotlib unavailable; skipping success-case plot.")
@@ -896,7 +897,8 @@ def _plot_success_case(
         fig.tight_layout(rect=[0, 0, 1, 0.96])
 
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"success_case_{label}{filename_suffix}.png"
+        tag = file_tag or label
+        out_path = out_dir / f"success_case_{tag}{filename_suffix}.png"
         fig.savefig(out_path, dpi=150)
         plt.close(fig)
         logging.info("Saved success-case plot to %s", out_path)
@@ -1082,6 +1084,7 @@ def main():
     weak_success_prob = float("inf")
     weak_success_ef = float("inf")
     weak_success_label = "weak_success"
+    weak_success_file_tag = None
 
     with torch.no_grad():
         for batch in ds:
@@ -1148,7 +1151,8 @@ def main():
                                 weak_success_ef = ef_val
                                 weak_success_prob = prob_val
                                 weak_success_path = Path(file_list[global_idx])
-                                weak_success_label = f"{_safe_filename(file_list, global_idx)}_EF{int(ef_val)}_weak"
+                                weak_success_label = f"{_safe_filename(file_list, global_idx)}_EF{int(ef_val)}"
+                                weak_success_file_tag = f"{weak_success_label}_weak"
             if false_catalog:
                 for i in range(batch_size):
                     idx = sample_index + i
@@ -1198,6 +1202,7 @@ def main():
             weak_success_label,
             non_retagged_root=args.non_retagged_root,
             retagged_root=DATA_ROOT_PATH,
+            file_tag=weak_success_file_tag,
         )
     if false_catalog:
         out_path = eval_out_dir / "false_cases.json"
