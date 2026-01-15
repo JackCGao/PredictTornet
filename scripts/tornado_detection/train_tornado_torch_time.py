@@ -28,7 +28,7 @@ import lightning as L
 import torch
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data._utils.collate import default_collate
 from torchmetrics import MetricCollection
 from torchmetrics.classification import (
@@ -45,8 +45,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from tornet.data.constants import ALL_VARIABLES
-from tornet.data.loader import get_dataloader
+from tornet.data.loader import get_dataloader, query_catalog, read_file
 from tornet.models.torch.cnn_baseline import TornadoClassifier, TornadoLikelihood
+from tornet.models.torch.cnn_lstm import TornadoSeqClassifier
 from tornet.utils.general import make_callback_dirs, make_exp_dir
 import numpy as np  # used only for optuna logging
 
@@ -80,7 +81,7 @@ DEFAULT_CONFIG = {
     "train_years": list(range(2013, 2021)),
     "val_years": list(range(2021, 2023)),
     "batch_size": 128,
-    "model": "vgg",
+    "model": "vgg",  # use "cnn_lstm" to enable sequence model
     "start_filters": 48,
     "learning_rate": 1e-4,
     "decay_steps": 1386,
@@ -101,6 +102,9 @@ DEFAULT_CONFIG = {
     "exp_dir": EXP_DIR,
     "dataloader": "torch",
     "dataloader_kwargs": {"tilt_last": False},
+    "sequence_length": 4,
+    "lstm_hidden_size": 64,
+    "lstm_layers": 1,
     "accelerator": "auto",
     "devices": 1,
     "precision": "32-true",
@@ -339,6 +343,172 @@ def _compute_csi(precision: float | None, recall: float | None) -> float | None:
     return (precision * recall) / denom
 
 
+class TornadoSeqLightning(L.LightningModule):
+    """Lightning wrapper for the CNN+LSTM sequence classifier."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        lr: float = 1e-3,
+        lr_decay_rate: float = 0.9,
+        lr_decay_steps: int = 1,
+        label_smoothing: float = 0.0,
+        weight_decay: float = 1e-4,
+        metrics: MetricCollection | None = None,
+        loss_type: str = "cce",
+    ):
+        super().__init__()
+        self.model = model
+        self.lr = lr
+        self.lr_decay_rate = lr_decay_rate
+        self.lr_decay_steps = lr_decay_steps
+        self.weight_decay = weight_decay
+        self.label_smoothing = label_smoothing
+        self.loss_type = loss_type.lower()
+        if self.loss_type == "bce":
+            self.loss = nn.BCEWithLogitsLoss()
+        else:
+            self.loss_type = "cce"
+            self.loss = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
+        if metrics:
+            self.train_metrics = metrics.clone(prefix="train_")
+            self.valid_metrics = metrics.clone(prefix="val_")
+        else:
+            self.train_metrics = self.valid_metrics = None
+
+    def forward(self, batch):
+        return self.model(batch)
+
+    def training_step(self, batch, _):
+        y = torch.squeeze(batch.pop("label")).long()
+        logits = self.model(batch)  # [batch,2]
+        if self.loss_type == "bce":
+            loss = self.loss(logits[:, 1], y.float())
+        else:
+            loss = self.loss(logits, y)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        if self.train_metrics:
+            met_out = self.train_metrics(logits[:, 1], y)
+            self.log_dict(met_out, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        return loss
+
+    def validation_step(self, batch, _):
+        y = torch.squeeze(batch.pop("label")).long()
+        logits = self.model(batch)
+        if self.loss_type == "bce":
+            loss = self.loss(logits[:, 1], y.float())
+        else:
+            loss = self.loss(logits, y)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        if self.valid_metrics:
+            met_out = self.valid_metrics(logits[:, 1], y)
+            self.log_dict(met_out, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(
+            self.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
+        scheduler = {
+            "scheduler": torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=self.lr_decay_steps,
+                gamma=self.lr_decay_rate,
+            ),
+            "interval": "epoch",
+            "frequency": 1,
+        }
+        return [optimizer], [scheduler]
+
+
+class TornadoSequenceDataset(Dataset):
+    """Load full time sequences for training the CNN+LSTM model."""
+
+    def __init__(
+        self,
+        file_list: List[str],
+        variables: List[str],
+        sequence_length: int,
+        tilt_last: bool = False,
+    ):
+        self.file_list = file_list
+        self.variables = variables
+        self.sequence_length = max(1, sequence_length)
+        self.tilt_last = tilt_last
+
+    def __len__(self) -> int:
+        return len(self.file_list)
+
+    def __getitem__(self, idx: int):
+        path = self.file_list[idx]
+        data = read_file(
+            path,
+            variables=self.variables,
+            n_frames=None,
+            tilt_last=self.tilt_last,
+        )
+        import tornet.data.preprocess as pp
+
+        labels = np.asarray(data.get("label"))
+        pos_idx = np.where(labels == 1)[0]
+        target_idx = int(pos_idx[-1]) if len(pos_idx) else labels.shape[0] - 1
+        start_idx = max(0, target_idx - self.sequence_length + 1)
+        idxs = list(range(start_idx, target_idx + 1))
+        while len(idxs) < self.sequence_length:
+            idxs = [idxs[0]] + idxs
+
+        feats: Dict[str, torch.Tensor] = {}
+        for k in self.variables + ["range_folded_mask"]:
+            arr = np.asarray(data[k])[idxs]
+            t = torch.as_tensor(arr)
+            if self.tilt_last and t.dim() == 3:
+                t = t.unsqueeze(-1)
+            feats[k] = t
+
+        base_coords = pp.compute_coordinates(data, tilt_last=self.tilt_last)
+        coords_seq = np.stack([base_coords for _ in idxs], axis=0)
+        feats["coordinates"] = torch.as_tensor(coords_seq)
+        feats["label"] = torch.as_tensor(int(labels[target_idx]), dtype=torch.long)
+        return feats
+
+
+def _make_sequence_loader(
+    data_root: str,
+    years: List[int],
+    data_type: str,
+    batch_size: int,
+    variables: List[str],
+    sequence_length: int,
+    tilt_last: bool,
+    random_state: int = 1234,
+    workers: int | None = None,
+    pin_memory: bool = False,
+):
+    if workers is None:
+        cpu_total = os.cpu_count() or 1
+        workers = max(cpu_total - 1, 1)
+    file_list = query_catalog(data_root, data_type, years, random_state=random_state)
+    dataset = TornadoSequenceDataset(
+        file_list=file_list,
+        variables=variables + ["range_folded_mask"],
+        sequence_length=sequence_length,
+        tilt_last=tilt_last,
+    )
+    shuffle = data_type == "train"
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=workers,
+        pin_memory=pin_memory,
+        persistent_workers=workers > 0,
+        collate_fn=lambda batch: _to_float32(default_collate(batch)),
+    )
+    return loader
+
+
 def _prepare_dataloader_kwargs(config: Dict) -> Dict:
     dataloader_kwargs = _clone_dict(config.get("dataloader_kwargs"))
     dataloader_kwargs.setdefault("tilt_last", False)
@@ -406,6 +576,8 @@ def main(config: Dict):
     val_years = config.get("val_years")
     dataloader_name = config.get("dataloader")
     dataloader_kwargs = _prepare_dataloader_kwargs(config)
+    tilt_last_flag = dataloader_kwargs.get("tilt_last", False)
+    model_name = config.get("model", "vgg")
 
     logging.info("Using %s dataloader", dataloader_name)
     if "tfds" in dataloader_name and "TFDS_DATA_DIR" in os.environ:
@@ -419,55 +591,103 @@ def main(config: Dict):
         "wW": config.get("wW"),
     }
 
-    ds_train_raw = get_dataloader(
-        dataloader_name,
-        DATA_ROOT,
-        train_years,
-        "train",
-        batch_size,
-        weights,
-        **dataloader_kwargs,
-    )
-    _drop_missing_files(ds_train_raw, "train")
-    ds_val_raw = get_dataloader(
-        dataloader_name,
-        DATA_ROOT,
-        val_years,
-        "train",
-        batch_size,
-        weights,
-        **dataloader_kwargs,
-    )
-    _drop_missing_files(ds_val_raw, "validation")
-    ds_train = _wrap_loader_for_lightning(ds_train_raw)
-    ds_val = _wrap_loader_for_lightning(ds_val_raw)
+    if model_name == "cnn_lstm":
+        seq_len = int(config.get("sequence_length", 4))
+        ds_train = _make_sequence_loader(
+            DATA_ROOT,
+            list(train_years),
+            "train",
+            batch_size,
+            input_variables,
+            sequence_length=seq_len,
+            tilt_last=tilt_last_flag,
+        )
+        ds_val = _make_sequence_loader(
+            DATA_ROOT,
+            list(val_years),
+            "train",
+            batch_size,
+            input_variables,
+            sequence_length=seq_len,
+            tilt_last=tilt_last_flag,
+        )
+    else:
+        ds_train_raw = get_dataloader(
+            dataloader_name,
+            DATA_ROOT,
+            train_years,
+            "train",
+            batch_size,
+            weights,
+            **dataloader_kwargs,
+        )
+        _drop_missing_files(ds_train_raw, "train")
+        ds_val_raw = get_dataloader(
+            dataloader_name,
+            DATA_ROOT,
+            val_years,
+            "train",
+            batch_size,
+            weights,
+            **dataloader_kwargs,
+        )
+        _drop_missing_files(ds_val_raw, "validation")
+        ds_train = _wrap_loader_for_lightning(ds_train_raw)
+        ds_val = _wrap_loader_for_lightning(ds_val_raw)
 
     sample_batch = next(iter(ds_train))
     input_shape, coord_shape = _infer_input_shapes(sample_batch, input_variables)
     include_range_folded = "range_folded_mask" in sample_batch
 
-    model = TornadoLikelihood(
-        shape=input_shape,
-        c_shape=coord_shape,
-        input_variables=input_variables,
-        start_filters=start_filters,
-        include_range_folded=include_range_folded,
-        kernel_size=config.get("kernel_size", 3),
-        n_blocks=config.get("n_blocks", 4),
-        convs_per_block=config.get("convs_per_block"),
-        drop_rate=config.get("drop_rate", 0.1),
-    )
     metrics = _build_metrics()
-    classifier = TornadoClassifier(
-        model=model,
-        lr=learning_rate,
-        lr_decay_rate=decay_rate,
-        lr_decay_steps=decay_steps,
-        label_smoothing=label_smooth,
-        weight_decay=l2_reg,
-        metrics=metrics,
-        loss_type=config.get("loss", "cce"),
-    )
+    if model_name == "cnn_lstm":
+        model = TornadoSeqClassifier(
+            shape=input_shape,
+            c_shape=coord_shape,
+            input_variables=input_variables,
+            include_range_folded=include_range_folded,
+            start_filters=start_filters,
+            kernel_size=config.get("kernel_size", 3),
+            n_blocks=config.get("n_blocks", 4),
+            convs_per_block=config.get("convs_per_block"),
+            drop_rate=config.get("drop_rate", 0.1),
+            lstm_hidden_size=int(config.get("lstm_hidden_size", 64)),
+            lstm_layers=int(config.get("lstm_layers", 1)),
+            sequence_length=int(config.get("sequence_length", 4)),
+            tilt_last=tilt_last_flag,
+        )
+        classifier = TornadoSeqLightning(
+            model=model,
+            lr=learning_rate,
+            lr_decay_rate=decay_rate,
+            lr_decay_steps=decay_steps,
+            label_smoothing=label_smooth,
+            weight_decay=l2_reg,
+            metrics=metrics,
+            loss_type=config.get("loss", "cce"),
+        )
+    else:
+        model = TornadoLikelihood(
+            shape=input_shape,
+            c_shape=coord_shape,
+            input_variables=input_variables,
+            start_filters=start_filters,
+            include_range_folded=include_range_folded,
+            kernel_size=config.get("kernel_size", 3),
+            n_blocks=config.get("n_blocks", 4),
+            convs_per_block=config.get("convs_per_block"),
+            drop_rate=config.get("drop_rate", 0.1),
+        )
+        classifier = TornadoClassifier(
+            model=model,
+            lr=learning_rate,
+            lr_decay_rate=decay_rate,
+            lr_decay_steps=decay_steps,
+            label_smoothing=label_smooth,
+            weight_decay=l2_reg,
+            metrics=metrics,
+            loss_type=config.get("loss", "cce"),
+        )
 
     expdir = make_exp_dir(exp_dir=exp_dir, prefix=exp_name)
     logging.info("expdir=%s", expdir)
