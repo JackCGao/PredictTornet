@@ -959,10 +959,7 @@ def _plot_metric_curves(
         )
         ax.set_xlabel("False Positive Rate")
         ax.set_ylabel("True Positive Rate")
-        auc_val = metrics.get("AUC")
         title = "ROC Curve"
-        if auc_val is not None:
-            title = f"ROC Curve (AUC={auc_val:.3f})"
         ax.set_title(title)
         ax.legend(loc="lower right")
         fig.tight_layout()
@@ -982,10 +979,7 @@ def _plot_metric_curves(
         ax.plot(recall.cpu(), precision.cpu(), color="#2ca02c", label=model_label)
         ax.set_xlabel("Recall")
         ax.set_ylabel("Precision")
-        aucpd_val = metrics.get("AUCPD")
         title = "Precision-Recall Curve"
-        if aucpd_val is not None:
-            title = f"Precision-Recall Curve (AUCPD={aucpd_val:.3f})"
         ax.set_title(title)
         ax.legend(loc="lower left")
         fig.tight_layout()
@@ -1018,7 +1012,7 @@ def _plot_metric_curves(
         ax.set_ylim(0, 1.0)
         ax.set_xlabel("Success Rate")
         ax.set_ylabel("True Positive Rate")
-        ax.set_title("Performance Diagram (CSI)")
+        ax.set_title("Performance Diagram")
         ax.legend(loc="upper right")
         fig.tight_layout()
         out_path = out_dir / "csi_performance.png"
