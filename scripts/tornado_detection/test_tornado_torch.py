@@ -569,6 +569,7 @@ def _load_plot_data(
         if "range_limits" in ds:
             data["rng_lower"] = np.array(ds["range_limits"].values[0:1])
             data["rng_upper"] = np.array(ds["range_limits"].values[1:])
+        _update_latlon_metadata(ds, data)
         data["event_id"] = np.array([int(ds.attrs.get("event_id", -1))], dtype=np.int64)
         data["ef_number"] = np.array([int(ds.attrs.get("ef_number", -1))], dtype=np.int64)
     return data
@@ -585,11 +586,89 @@ def _load_plot_metadata(sample_path: Path) -> Dict[str, np.ndarray]:
             if "range_limits" in ds:
                 data["rng_lower"] = np.array(ds["range_limits"].values[0:1])
                 data["rng_upper"] = np.array(ds["range_limits"].values[1:])
+            _update_latlon_metadata(ds, data)
             data["event_id"] = np.array([int(ds.attrs.get("event_id", -1))], dtype=np.int64)
             data["ef_number"] = np.array([int(ds.attrs.get("ef_number", -1))], dtype=np.int64)
     except Exception as exc:  # noqa: BLE001
         logging.warning("Failed to load plot metadata from %s: %s", sample_path, exc)
     return data
+
+
+def _update_latlon_metadata(ds: xr.Dataset, data: Dict[str, np.ndarray]) -> None:
+    keys = [
+        ("radar_lat", "radar_lon"),
+        ("station_lat", "station_lon"),
+        ("site_lat", "site_lon"),
+        ("site_latitude", "site_longitude"),
+        ("latitude", "longitude"),
+        ("lat", "lon"),
+    ]
+    for lat_key, lon_key in keys:
+        if lat_key in ds.attrs and lon_key in ds.attrs:
+            data["radar_lat"] = np.array([float(ds.attrs[lat_key])])
+            data["radar_lon"] = np.array([float(ds.attrs[lon_key])])
+            return
+        if lat_key in ds and lon_key in ds:
+            data["radar_lat"] = np.array([float(ds[lat_key].values)])
+            data["radar_lon"] = np.array([float(ds[lon_key].values)])
+            return
+
+
+def _latlon_grid(
+    plot_meta: Dict[str, np.ndarray],
+    target_h: int,
+    target_w: int,
+) -> Tuple[np.ndarray, np.ndarray] | None:
+    if "radar_lat" not in plot_meta or "radar_lon" not in plot_meta:
+        return None
+    if "az_lower" not in plot_meta or "az_upper" not in plot_meta:
+        return None
+    if "rng_lower" not in plot_meta or "rng_upper" not in plot_meta:
+        return None
+
+    lat0 = float(np.asarray(plot_meta["radar_lat"])[0])
+    lon0 = float(np.asarray(plot_meta["radar_lon"])[0])
+    az_lower = float(np.asarray(plot_meta["az_lower"])[0])
+    az_upper = float(np.asarray(plot_meta["az_upper"])[0])
+    rng_lower = float(np.asarray(plot_meta["rng_lower"])[0])
+    rng_upper = float(np.asarray(plot_meta["rng_upper"])[0])
+    if az_upper <= az_lower:
+        az_lower, az_upper = 0.0, 360.0
+    if rng_upper <= rng_lower:
+        rng_lower, rng_upper = 0.0, 1.0
+
+    az = np.deg2rad(np.linspace(az_lower, az_upper, target_h))
+    rng = np.linspace(rng_lower, rng_upper, target_w)
+    rng_grid, az_grid = np.meshgrid(rng, az)
+
+    earth_radius = 6371000.0
+    lat0_rad = np.deg2rad(lat0)
+    lon0_rad = np.deg2rad(lon0)
+    ang_dist = rng_grid / earth_radius
+
+    sin_lat0 = np.sin(lat0_rad)
+    cos_lat0 = np.cos(lat0_rad)
+    sin_ad = np.sin(ang_dist)
+    cos_ad = np.cos(ang_dist)
+
+    lat_rad = np.arcsin(sin_lat0 * cos_ad + cos_lat0 * sin_ad * np.cos(az_grid))
+    lon_rad = lon0_rad + np.arctan2(
+        np.sin(az_grid) * sin_ad * cos_lat0,
+        cos_ad - sin_lat0 * np.sin(lat_rad),
+    )
+
+    return np.rad2deg(lon_rad), np.rad2deg(lat_rad)
+
+
+def _contour_levels(data: np.ndarray, n_levels: int = 4) -> np.ndarray | None:
+    finite = np.asarray(data)[np.isfinite(data)]
+    if finite.size == 0:
+        return None
+    vmin = float(np.min(finite))
+    vmax = float(np.max(finite))
+    if vmax <= vmin:
+        return None
+    return np.linspace(vmin, vmax, n_levels + 2)[1:-1]
 
 def _build_model_input(
     sample_path: Path,
@@ -610,6 +689,7 @@ def _build_model_input(
         if "range_limits" in ds:
             plot_meta["rng_lower"] = np.array(ds["range_limits"].values[0:1])
             plot_meta["rng_upper"] = np.array(ds["range_limits"].values[1:])
+        _update_latlon_metadata(ds, plot_meta)
         plot_meta["event_id"] = np.array([int(ds.attrs.get("event_id", -1))], dtype=np.int64)
         plot_meta["ef_number"] = np.array([int(ds.attrs.get("ef_number", -1))], dtype=np.int64)
 
@@ -792,18 +872,49 @@ def _generate_grad_cam_plots(
 
             cmap, norm = get_cmap("cnn_output")
             fig, ax = plt.subplots(figsize=(8, 6))
-            ax.imshow(
-                plot_data["cnn_output"][0, ..., 0],
-                origin="lower",
-                aspect="auto",
-                extent=[rng_lower, rng_upper, az_lower, az_upper],
-                cmap=cmap,
-                norm=norm,
-            )
-            ax.set_xlabel("Range (km)")
-            ax.set_ylabel("Azimuth (deg)")
+            lonlat = _latlon_grid(plot_data, target_h, target_w)
+            if lonlat is None:
+                img = ax.imshow(
+                    plot_data["cnn_output"][0, ..., 0],
+                    origin="lower",
+                    aspect="auto",
+                    extent=[rng_lower, rng_upper, az_lower, az_upper],
+                    cmap=cmap,
+                    norm=norm,
+                )
+                ax.set_xlabel("Range (km)")
+                ax.set_ylabel("Azimuth (deg)")
+            else:
+                lon_grid, lat_grid = lonlat
+                lon_min = float(np.nanmin(lon_grid))
+                lon_max = float(np.nanmax(lon_grid))
+                lat_min = float(np.nanmin(lat_grid))
+                lat_max = float(np.nanmax(lat_grid))
+                img = ax.pcolormesh(
+                    lon_grid,
+                    lat_grid,
+                    plot_data["cnn_output"][0, ..., 0],
+                    shading="nearest",
+                    cmap=cmap,
+                    norm=norm,
+                )
+                levels = _contour_levels(plot_data["cnn_output"][0, ..., 0])
+                if levels is not None:
+                    ax.contour(
+                        lon_grid,
+                        lat_grid,
+                        plot_data["cnn_output"][0, ..., 0],
+                        levels=levels,
+                        colors="black",
+                        linewidths=0.6,
+                    )
+                ax.set_xlabel("Longitude")
+                ax.set_ylabel("Latitude")
+                ax.set_aspect("equal", adjustable="box")
+                ax.set_xlim(lon_min, lon_max)
+                ax.set_ylim(lat_min, lat_max)
             ax.set_title(f"{file_tag} | Tornado Likelihood")
-            fig.colorbar(ax.images[0], ax=ax, shrink=0.8, label="Likelihood")
+            fig.colorbar(img, ax=ax, shrink=0.8, label="Likelihood")
             fig.tight_layout()
             out_path = out_dir / f"{file_tag}_likelihood.png"
             fig.savefig(out_path, dpi=150)
@@ -1050,7 +1161,7 @@ def _plot_success_likelihood(
         logging.warning("matplotlib unavailable; skipping likelihood plot.")
         return
     try:
-        from tornet.display.display import plot_radar
+        from tornet.display.display import plot_radar, get_cmap
     except Exception as exc:  # pragma: no cover - optional dependency
         logging.warning("tornet.display.display unavailable; skipping likelihood plot: %s", exc)
         return
@@ -1110,19 +1221,59 @@ def _plot_success_likelihood(
     plot_data: Dict[str, np.ndarray] = dict(plot_meta)
     plot_data["cnn_output"] = prob_resized[None, ..., None]
 
-    fig = plt.figure(figsize=(12, 6), edgecolor="k")
-    plot_radar(
-        plot_data,
-        channels=["cnn_output"],
-        fig=fig,
-        time_idx=0,
-        sweep_idx=[0],
-        include_cbar=True,
-        n_rows=1,
-        n_cols=1,
-    )
-    fig.suptitle(f"{label} | Tornado Likelihood", y=0.98)
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    lonlat = _latlon_grid(plot_data, target_h, target_w)
+    if lonlat is None:
+        fig = plt.figure(figsize=(12, 6), edgecolor="k")
+        plot_radar(
+            plot_data,
+            channels=["cnn_output"],
+            fig=fig,
+            time_idx=0,
+            sweep_idx=[0],
+            include_cbar=True,
+            n_rows=1,
+            n_cols=1,
+        )
+        fig.suptitle(f"{label} | Tornado Likelihood", y=0.98)
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+    else:
+        lon_grid, lat_grid = lonlat
+        lon_min = float(np.nanmin(lon_grid))
+        lon_max = float(np.nanmax(lon_grid))
+        lat_min = float(np.nanmin(lat_grid))
+        lat_max = float(np.nanmax(lat_grid))
+        lon_min = float(np.nanmin(lon_grid))
+        lon_max = float(np.nanmax(lon_grid))
+        lat_min = float(np.nanmin(lat_grid))
+        lat_max = float(np.nanmax(lat_grid))
+        fig, ax = plt.subplots(figsize=(8, 6))
+        cmap, norm = get_cmap("cnn_output")
+        mesh = ax.pcolormesh(
+            lon_grid,
+            lat_grid,
+            prob_resized,
+            shading="nearest",
+            cmap=cmap,
+            norm=norm,
+        )
+        levels = _contour_levels(prob_resized)
+        if levels is not None:
+            ax.contour(
+                lon_grid,
+                lat_grid,
+                prob_resized,
+                levels=levels,
+                colors="black",
+                linewidths=0.6,
+            )
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(lon_min, lon_max)
+        ax.set_ylim(lat_min, lat_max)
+        ax.set_title(f"{label} | Tornado Likelihood")
+        fig.colorbar(mesh, ax=ax, shrink=0.8, label="Likelihood")
+        fig.tight_layout()
 
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"success_case_{label}_likelihood.png"
@@ -1134,7 +1285,25 @@ def _plot_success_likelihood(
         return
 
     ablation_maps: Dict[str, np.ndarray] = {}
+    raw_maps: Dict[str, np.ndarray] = {}
     base_prob = probs
+
+    def _extract_raw_map(var_name: str) -> np.ndarray | None:
+        if var_name not in model_input:
+            return None
+        arr = model_input[var_name]
+        if not torch.is_tensor(arr):
+            return None
+        arr = arr.detach().cpu()
+        if arr.dim() == 4:
+            if tilt_last:
+                return arr[0, :, :, 0].numpy()
+            return arr[0, 0, :, :].numpy()
+        if arr.dim() == 3:
+            if tilt_last:
+                return arr[:, :, 0].numpy()
+            return arr[0, :, :].numpy()
+        return None
 
     def _ablation_prob(var_name: str) -> np.ndarray | None:
         if var_name not in model_input:
@@ -1160,6 +1329,9 @@ def _plot_success_likelihood(
         delta_map = _ablation_prob(var)
         if delta_map is not None:
             ablation_maps[var] = delta_map
+        raw_map = _extract_raw_map(var)
+        if raw_map is not None:
+            raw_maps[var] = raw_map
 
     if not ablation_maps:
         return
@@ -1174,47 +1346,132 @@ def _plot_success_likelihood(
         "YlGn",
         "PuRd",
     ]
-    az_lower = float(np.asarray(plot_data.get("az_lower", [0.0]))[0])
-    az_upper = float(np.asarray(plot_data.get("az_upper", [360.0]))[0])
-    rng_lower = float(np.asarray(plot_data.get("rng_lower", [0.0]))[0]) / 1e3
-    rng_upper = float(np.asarray(plot_data.get("rng_upper", [1.0]))[0]) / 1e3
-    if az_upper <= az_lower:
-        az_lower, az_upper = 0.0, 360.0
-    if rng_upper <= rng_lower:
-        rng_lower, rng_upper = 0.0, 1.0
-    extent = [rng_lower, rng_upper, az_lower, az_upper]
+    lonlat = _latlon_grid(plot_data, target_h, target_w)
+    if lonlat is None:
+        az_lower = float(np.asarray(plot_data.get("az_lower", [0.0]))[0])
+        az_upper = float(np.asarray(plot_data.get("az_upper", [360.0]))[0])
+        rng_lower = float(np.asarray(plot_data.get("rng_lower", [0.0]))[0]) / 1e3
+        rng_upper = float(np.asarray(plot_data.get("rng_upper", [1.0]))[0]) / 1e3
+        if az_upper <= az_lower:
+            az_lower, az_upper = 0.0, 360.0
+        if rng_upper <= rng_lower:
+            rng_lower, rng_upper = 0.0, 1.0
+        extent = [rng_lower, rng_upper, az_lower, az_upper]
+    else:
+        lon_grid, lat_grid = lonlat
 
-    n_panels = 1 + len(ablation_maps)
+    n_panels = 1 + 2 * len(ablation_maps)
     n_rows, n_cols = _grid_for_channels(n_panels)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows))
     axes = np.atleast_1d(axes).flatten()
 
-    axes[0].imshow(
-        plot_data["cnn_output"][0, ..., 0],
-        origin="lower",
-        aspect="auto",
-        extent=extent,
-    )
-    axes[0].set_title("Baseline", color="#1f77b4")
-    axes[0].set_xlabel("Range (km)")
-    axes[0].set_ylabel("Azimuth (deg)")
-
-    for idx, (var, delta_map) in enumerate(ablation_maps.items(), start=1):
-        cmap_name = cmap_names[(idx - 1) % len(cmap_names)]
-        cmap = plt.get_cmap(cmap_name)
-        img = axes[idx].imshow(
-            delta_map,
+    base_img = plot_data["cnn_output"][0, ..., 0]
+    if lonlat is None:
+        axes[0].imshow(
+            base_img,
             origin="lower",
             aspect="auto",
             extent=extent,
-            cmap=cmap,
         )
-        axes[idx].set_title(f"{var} delta", color=cmap(0.7))
-        axes[idx].set_xlabel("Range (km)")
-        axes[idx].set_ylabel("Azimuth (deg)")
-        fig.colorbar(img, ax=axes[idx], shrink=0.8, label="Delta prob")
+        axes[0].set_xlabel("Range (km)")
+        axes[0].set_ylabel("Azimuth (deg)")
+    else:
+        axes[0].pcolormesh(
+            lon_grid,
+            lat_grid,
+            base_img,
+            shading="nearest",
+        )
+        axes[0].set_xlabel("Longitude")
+        axes[0].set_ylabel("Latitude")
+        axes[0].set_aspect("equal", adjustable="box")
+        axes[0].set_xlim(lon_min, lon_max)
+        axes[0].set_ylim(lat_min, lat_max)
+        levels = _contour_levels(base_img)
+        if levels is not None:
+            axes[0].contour(
+                lon_grid,
+                lat_grid,
+                base_img,
+                levels=levels,
+                colors="black",
+                linewidths=0.6,
+            )
+    axes[0].set_title("Baseline", color="#1f77b4")
 
-    for idx in range(len(ablation_maps) + 1, len(axes)):
+    panel_idx = 1
+    for var, delta_map in ablation_maps.items():
+        raw_map = raw_maps.get(var)
+        cmap_var, norm_var = get_cmap(var)
+        if raw_map is not None:
+            if lonlat is None:
+                axes[panel_idx].imshow(
+                    raw_map,
+                    origin="lower",
+                    aspect="auto",
+                    extent=extent,
+                    cmap=cmap_var,
+                    norm=norm_var,
+                )
+                axes[panel_idx].set_xlabel("Range (km)")
+                axes[panel_idx].set_ylabel("Azimuth (deg)")
+            else:
+                axes[panel_idx].pcolormesh(
+                    lon_grid,
+                    lat_grid,
+                    raw_map,
+                    shading="nearest",
+                    cmap=cmap_var,
+                    norm=norm_var,
+                )
+                axes[panel_idx].set_xlabel("Longitude")
+                axes[panel_idx].set_ylabel("Latitude")
+                axes[panel_idx].set_aspect("equal", adjustable="box")
+                axes[panel_idx].set_xlim(lon_min, lon_max)
+                axes[panel_idx].set_ylim(lat_min, lat_max)
+            axes[panel_idx].set_title(f"{var} raw", color="#333333")
+            panel_idx += 1
+
+        cmap_name = cmap_names[(panel_idx - 2) % len(cmap_names)]
+        cmap = plt.get_cmap(cmap_name)
+        if lonlat is None:
+            img = axes[panel_idx].imshow(
+                delta_map,
+                origin="lower",
+                aspect="auto",
+                extent=extent,
+                cmap=cmap,
+            )
+            axes[panel_idx].set_xlabel("Range (km)")
+            axes[panel_idx].set_ylabel("Azimuth (deg)")
+        else:
+            img = axes[panel_idx].pcolormesh(
+                lon_grid,
+                lat_grid,
+                delta_map,
+                shading="nearest",
+                cmap=cmap,
+            )
+            max_abs = float(np.nanmax(np.abs(delta_map))) if np.isfinite(delta_map).any() else 0.0
+            if max_abs > 0:
+                axes[panel_idx].contour(
+                    lon_grid,
+                    lat_grid,
+                    delta_map,
+                    levels=np.linspace(-max_abs, max_abs, 5),
+                    colors="black",
+                    linewidths=0.6,
+                )
+            axes[panel_idx].set_xlabel("Longitude")
+            axes[panel_idx].set_ylabel("Latitude")
+            axes[panel_idx].set_aspect("equal", adjustable="box")
+            axes[panel_idx].set_xlim(lon_min, lon_max)
+            axes[panel_idx].set_ylim(lat_min, lat_max)
+        axes[panel_idx].set_title(f"{var} delta", color=cmap(0.7))
+        fig.colorbar(img, ax=axes[panel_idx], shrink=0.8, label="Delta prob")
+        panel_idx += 1
+
+    for idx in range(panel_idx, len(axes)):
         axes[idx].axis("off")
 
     fig.suptitle(f"{label} | Variable Ablation Deltas", y=0.98)
