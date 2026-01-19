@@ -1130,6 +1130,100 @@ def _plot_success_likelihood(
     plt.close(fig)
     logging.info("Saved likelihood plot to %s", out_path)
 
+    if not variables:
+        return
+
+    ablation_maps: Dict[str, np.ndarray] = {}
+    base_prob = probs
+
+    def _ablation_prob(var_name: str) -> np.ndarray | None:
+        if var_name not in model_input:
+            return None
+        ablated = {
+            key: (val.clone() if torch.is_tensor(val) else val)
+            for key, val in model_input.items()
+        }
+        ablated[var_name] = torch.zeros_like(ablated[var_name])
+        with torch.no_grad():
+            ablated_logits = classifier.model(ablated)
+            ablated_probs = torch.sigmoid(ablated_logits)
+            delta = base_prob - ablated_probs
+            delta_resized = F.interpolate(
+                delta,
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+            )[0, 0].detach().cpu().numpy()
+        return delta_resized
+
+    for var in variables:
+        delta_map = _ablation_prob(var)
+        if delta_map is not None:
+            ablation_maps[var] = delta_map
+
+    if not ablation_maps:
+        return
+
+    cmap_names = [
+        "Reds",
+        "Blues",
+        "Greens",
+        "Oranges",
+        "Purples",
+        "Greys",
+        "YlGn",
+        "PuRd",
+    ]
+    az_lower = float(np.asarray(plot_data.get("az_lower", [0.0]))[0])
+    az_upper = float(np.asarray(plot_data.get("az_upper", [360.0]))[0])
+    rng_lower = float(np.asarray(plot_data.get("rng_lower", [0.0]))[0]) / 1e3
+    rng_upper = float(np.asarray(plot_data.get("rng_upper", [1.0]))[0]) / 1e3
+    if az_upper <= az_lower:
+        az_lower, az_upper = 0.0, 360.0
+    if rng_upper <= rng_lower:
+        rng_lower, rng_upper = 0.0, 1.0
+    extent = [rng_lower, rng_upper, az_lower, az_upper]
+
+    n_panels = 1 + len(ablation_maps)
+    n_rows, n_cols = _grid_for_channels(n_panels)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows))
+    axes = np.atleast_1d(axes).flatten()
+
+    axes[0].imshow(
+        plot_data["cnn_output"][0, ..., 0],
+        origin="lower",
+        aspect="auto",
+        extent=extent,
+    )
+    axes[0].set_title("Baseline", color="#1f77b4")
+    axes[0].set_xlabel("Range (km)")
+    axes[0].set_ylabel("Azimuth (deg)")
+
+    for idx, (var, delta_map) in enumerate(ablation_maps.items(), start=1):
+        cmap_name = cmap_names[(idx - 1) % len(cmap_names)]
+        cmap = plt.get_cmap(cmap_name)
+        img = axes[idx].imshow(
+            delta_map,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=cmap,
+        )
+        axes[idx].set_title(f"{var} delta", color=cmap(0.7))
+        axes[idx].set_xlabel("Range (km)")
+        axes[idx].set_ylabel("Azimuth (deg)")
+        fig.colorbar(img, ax=axes[idx], shrink=0.8, label="Delta prob")
+
+    for idx in range(len(ablation_maps) + 1, len(axes)):
+        axes[idx].axis("off")
+
+    fig.suptitle(f"{label} | Variable Ablation Deltas", y=0.98)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    ablation_out = out_dir / f"success_case_{label}_likelihood_ablation.png"
+    fig.savefig(ablation_out, dpi=150)
+    plt.close(fig)
+    logging.info("Saved likelihood ablation plot to %s", ablation_out)
+
 
 def main():
     parser = _build_arg_parser()
