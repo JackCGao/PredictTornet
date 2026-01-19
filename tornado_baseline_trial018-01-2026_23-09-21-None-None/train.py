@@ -283,33 +283,6 @@ def _lightning_collate(batch):
     return _to_float32(features)
 
 
-def _sequence_collate(batch):
-    """Pad variable-length sequences along time axis and attach seq_len."""
-    max_len = max(int(sample["seq_len"]) for sample in batch)
-    collated: Dict[str, torch.Tensor] = {}
-    keys = batch[0].keys()
-    for key in keys:
-        values = [sample[key] for sample in batch]
-        first = values[0]
-        if (
-            torch.is_tensor(first)
-            and first.dim() >= 1
-            and key not in {"label", "seq_len"}
-        ):
-            padded = []
-            for value in values:
-                pad_len = max_len - value.shape[0]
-                if pad_len > 0:
-                    pad_shape = (pad_len,) + value.shape[1:]
-                    pad = torch.zeros(pad_shape, dtype=value.dtype)
-                    value = torch.cat([value, pad], dim=0)
-                padded.append(value)
-            collated[key] = torch.stack(padded, dim=0)
-        else:
-            collated[key] = default_collate(values)
-    return _to_float32(collated)
-
-
 def _wrap_loader_for_lightning(loader: DataLoader) -> DataLoader:
     """
     LightningModule expects dictionaries; make_torch_loader returns tuples. Wrap the
@@ -481,11 +454,10 @@ class TornadoSequenceDataset(Dataset):
         labels = np.asarray(data.get("label"))
         pos_idx = np.where(labels == 1)[0]
         target_idx = int(pos_idx[-1]) if len(pos_idx) else labels.shape[0] - 1
-        if len(pos_idx):
-            idxs = list(range(0, target_idx + 1))
-        else:
-            start_idx = max(0, target_idx - self.sequence_length + 1)
-            idxs = list(range(start_idx, target_idx + 1))
+        start_idx = max(0, target_idx - self.sequence_length + 1)
+        idxs = list(range(start_idx, target_idx + 1))
+        while len(idxs) < self.sequence_length:
+            idxs = [idxs[0]] + idxs
 
         feats: Dict[str, torch.Tensor] = {}
         for k in self.variables + ["range_folded_mask"]:
@@ -499,7 +471,6 @@ class TornadoSequenceDataset(Dataset):
         coords_seq = np.stack([base_coords for _ in idxs], axis=0)
         feats["coordinates"] = torch.as_tensor(coords_seq)
         feats["label"] = torch.as_tensor(int(labels[target_idx]), dtype=torch.long)
-        feats["seq_len"] = torch.as_tensor(len(idxs), dtype=torch.long)
         return feats
 
 
@@ -533,7 +504,7 @@ def _make_sequence_loader(
         num_workers=workers,
         pin_memory=pin_memory,
         persistent_workers=workers > 0,
-        collate_fn=_sequence_collate,
+        collate_fn=lambda batch: _to_float32(default_collate(batch)),
     )
     return loader
 

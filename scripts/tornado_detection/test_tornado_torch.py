@@ -597,6 +597,7 @@ def _build_model_input(
     time_idx: int,
     tilt_last: bool,
     include_range_folded: bool,
+    include_az: bool,
 ) -> Tuple[Dict[str, torch.Tensor], int, int, Dict[str, np.ndarray]]:
     data: Dict[str, torch.Tensor] = {}
     plot_meta: Dict[str, np.ndarray] = {}
@@ -641,7 +642,9 @@ def _build_model_input(
     if target_h is None or target_w is None:
         raise RuntimeError(f"No variables available to build model input for {sample_path}")
 
-    data = pp.add_coordinates(data, include_az=True, tilt_last=tilt_last, backend=torch)
+    data = pp.add_coordinates(
+        data, include_az=include_az, tilt_last=tilt_last, backend=torch
+    )
     for key, value in data.items():
         if torch.is_tensor(value):
             data[key] = value.unsqueeze(0)
@@ -834,6 +837,15 @@ def _plot_metric_curves(
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.plot(fpr.cpu(), tpr.cpu(), color="#1f77b4", label=model_label)
         ax.plot([0, 1], [0, 1], linestyle="--", color="#999999", linewidth=1)
+        tvs_auc = 0.6308
+        ax.scatter(
+            [tvs_auc],
+            [tvs_auc],
+            marker="v",
+            color="black",
+            label=f"TVS ({tvs_auc:.4f})",
+            zorder=3,
+        )
         ax.set_xlabel("False Positive Rate")
         ax.set_ylabel("True Positive Rate")
         auc_val = metrics.get("AUC")
@@ -1062,6 +1074,15 @@ def _plot_success_likelihood(
         return
 
     pre_time_idx = max(0, torn_time_idx - 1)
+    include_range_folded = getattr(
+        classifier.model, "include_range_folded", include_range_folded
+    )
+    coord_shape = getattr(classifier.model, "c_shape", None)
+    if coord_shape:
+        coord_channels = coord_shape[-1] if tilt_last else coord_shape[0]
+        include_az = coord_channels >= 3
+    else:
+        include_az = True
     try:
         model_input, target_h, target_w, plot_meta = _build_model_input(
             non_retagged_path,
@@ -1069,6 +1090,7 @@ def _plot_success_likelihood(
             pre_time_idx,
             tilt_last=tilt_last,
             include_range_folded=include_range_folded,
+            include_az=include_az,
         )
     except Exception as exc:  # noqa: BLE001
         logging.warning("Failed to build model input for likelihood plot: %s", exc)
