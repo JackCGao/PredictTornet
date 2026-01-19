@@ -43,6 +43,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from tornet.data.constants import ALL_VARIABLES
 from tornet.data.loader import get_dataloader, read_file
+import tornet.data.preprocess as pp
 from tornet.models.torch.cnn_baseline import TornadoClassifier, TornadoLikelihood
 
 logging.basicConfig(level=logging.INFO)
@@ -590,6 +591,62 @@ def _load_plot_metadata(sample_path: Path) -> Dict[str, np.ndarray]:
         logging.warning("Failed to load plot metadata from %s: %s", sample_path, exc)
     return data
 
+def _build_model_input(
+    sample_path: Path,
+    variables: List[str],
+    time_idx: int,
+    tilt_last: bool,
+    include_range_folded: bool,
+) -> Tuple[Dict[str, torch.Tensor], int, int, Dict[str, np.ndarray]]:
+    data: Dict[str, torch.Tensor] = {}
+    plot_meta: Dict[str, np.ndarray] = {}
+    with xr.open_dataset(sample_path) as ds:
+        if "time" in ds:
+            plot_meta["time"] = np.array([np.int64(ds["time"].values[time_idx])])
+        if "azimuth_limits" in ds:
+            plot_meta["az_lower"] = np.array(ds["azimuth_limits"].values[0:1])
+            plot_meta["az_upper"] = np.array(ds["azimuth_limits"].values[1:])
+        if "range_limits" in ds:
+            plot_meta["rng_lower"] = np.array(ds["range_limits"].values[0:1])
+            plot_meta["rng_upper"] = np.array(ds["range_limits"].values[1:])
+        plot_meta["event_id"] = np.array([int(ds.attrs.get("event_id", -1))], dtype=np.int64)
+        plot_meta["ef_number"] = np.array([int(ds.attrs.get("ef_number", -1))], dtype=np.int64)
+
+        target_h = None
+        target_w = None
+        for v in variables:
+            if v not in ds:
+                continue
+            arr = ds[v].isel(time=time_idx).values
+            if not tilt_last and arr.ndim == 3:
+                arr = np.transpose(arr, (2, 0, 1))
+            if target_h is None or target_w is None:
+                if tilt_last:
+                    target_h, target_w = arr.shape[0], arr.shape[1]
+                else:
+                    target_h, target_w = arr.shape[1], arr.shape[2]
+            data[v] = torch.as_tensor(arr)
+
+        if include_range_folded and "range_folded_mask" in ds:
+            arr = ds["range_folded_mask"].isel(time=time_idx).values
+            if not tilt_last and arr.ndim == 3:
+                arr = np.transpose(arr, (2, 0, 1))
+            data["range_folded_mask"] = torch.as_tensor(arr)
+
+        data["az_lower"] = torch.as_tensor(plot_meta.get("az_lower", np.array([0.0])))
+        data["az_upper"] = torch.as_tensor(plot_meta.get("az_upper", np.array([360.0])))
+        data["rng_lower"] = torch.as_tensor(plot_meta.get("rng_lower", np.array([0.0])))
+        data["rng_upper"] = torch.as_tensor(plot_meta.get("rng_upper", np.array([1.0])))
+
+    if target_h is None or target_w is None:
+        raise RuntimeError(f"No variables available to build model input for {sample_path}")
+
+    data = pp.add_coordinates(data, include_az=True, tilt_last=tilt_last, backend=torch)
+    for key, value in data.items():
+        if torch.is_tensor(value):
+            data[key] = value.unsqueeze(0)
+    return data, target_h, target_w, plot_meta
+
 def _grid_for_channels(n_channels: int) -> Tuple[int, int]:
     if n_channels <= 3:
         return (1, n_channels)
@@ -965,6 +1022,93 @@ def _plot_success_case(
     _plot_from_data(plot_data, "_actual", " (actual)", torn_time_idx)
 
 
+def _plot_success_likelihood(
+    classifier: TornadoClassifier,
+    sample_path: Path | None,
+    variables: List[str],
+    out_dir: Path,
+    label: str,
+    non_retagged_root: Path,
+    retagged_root: Path | None,
+    include_range_folded: bool,
+    tilt_last: bool,
+    device: torch.device,
+):
+    if plt is None:  # pragma: no cover - optional dependency
+        logging.warning("matplotlib unavailable; skipping likelihood plot.")
+        return
+    try:
+        from tornet.display.display import plot_radar
+    except Exception as exc:  # pragma: no cover - optional dependency
+        logging.warning("tornet.display.display unavailable; skipping likelihood plot: %s", exc)
+        return
+
+    if sample_path is None:
+        logging.warning("No file path available for likelihood plot.")
+        return
+
+    if not non_retagged_root.exists():
+        logging.warning("Non-retagged root does not exist: %s", non_retagged_root)
+        return
+
+    non_retagged_path = _map_to_non_retagged(sample_path, non_retagged_root, retagged_root)
+    if non_retagged_path is None:
+        logging.warning("No non-retagged match found for %s", sample_path)
+        return
+
+    torn_time_idx = _find_tornadic_time_index(non_retagged_path)
+    if torn_time_idx is None:
+        logging.warning("No tornadic frame_labels found in %s", non_retagged_path)
+        return
+
+    pre_time_idx = max(0, torn_time_idx - 1)
+    try:
+        model_input, target_h, target_w, plot_meta = _build_model_input(
+            non_retagged_path,
+            variables,
+            pre_time_idx,
+            tilt_last=tilt_last,
+            include_range_folded=include_range_folded,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to build model input for likelihood plot: %s", exc)
+        return
+
+    model_input = _move_to_device(model_input, device)
+    with torch.no_grad():
+        logits = classifier.model(model_input)
+        probs = torch.sigmoid(logits)
+        prob_resized = F.interpolate(
+            probs,
+            size=(target_h, target_w),
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0].detach().cpu().numpy()
+
+    plot_data: Dict[str, np.ndarray] = dict(plot_meta)
+    plot_data["cnn_output"] = prob_resized[None, ..., None]
+
+    fig = plt.figure(figsize=(12, 6), edgecolor="k")
+    plot_radar(
+        plot_data,
+        channels=["cnn_output"],
+        fig=fig,
+        time_idx=0,
+        sweep_idx=[0],
+        include_cbar=True,
+        n_rows=1,
+        n_cols=1,
+    )
+    fig.suptitle(f"{label} | Tornado Likelihood", y=0.98)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"success_case_{label}_likelihood.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    logging.info("Saved likelihood plot to %s", out_path)
+
+
 def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
@@ -1193,6 +1337,18 @@ def main():
             success_label,
             non_retagged_root=args.non_retagged_root,
             retagged_root=DATA_ROOT_PATH,
+        )
+        _plot_success_likelihood(
+            classifier=classifier,
+            sample_path=success_path,
+            variables=input_variables,
+            out_dir=eval_out_dir,
+            label=success_label,
+            non_retagged_root=args.non_retagged_root,
+            retagged_root=DATA_ROOT_PATH,
+            include_range_folded=include_range_folded,
+            tilt_last=dataloader_kwargs["tilt_last"],
+            device=device,
         )
     if weak_success_path is not None:
         _plot_success_case(
