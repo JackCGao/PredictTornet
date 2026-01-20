@@ -1597,6 +1597,15 @@ def main():
     weak_success_ef = float("inf")
     weak_success_label = "weak_success"
     weak_success_file_tag = None
+    worst_fn_path: Path | None = None
+    worst_fn_prob = float("inf")
+    worst_fn_ef = -1.0
+    worst_fn_label = "worst_false_negative"
+    worst_fn_file_tag = None
+    worst_fp_path: Path | None = None
+    worst_fp_prob = -1.0
+    worst_fp_label = "worst_false_positive"
+    worst_fp_file_tag = None
 
     with torch.no_grad():
         for batch in ds:
@@ -1666,6 +1675,14 @@ def main():
                                 weak_success_label = f"{_safe_filename(file_list, global_idx)}_EF{int(ef_val)}"
                                 weak_success_file_tag = f"{weak_success_label}_weak"
             if false_catalog:
+                ef_flat = None
+                if "ef_number" in batch:
+                    ef_values = batch.get("ef_number")
+                    if ef_values is not None:
+                        if torch.is_tensor(ef_values):
+                            ef_flat = ef_values.detach().cpu().view(-1)
+                        else:
+                            ef_flat = torch.as_tensor(ef_values).view(-1)
                 for i in range(batch_size):
                     idx = sample_index + i
                     if idx >= len(file_list):  # type: ignore[arg-type]
@@ -1678,10 +1695,34 @@ def main():
                         false_catalog["false_positives"].append(
                             {"file": path, "prob": prob, "label": label, "pred": pred}
                         )
+                        if (
+                            worst_fp_path is None
+                            or prob > worst_fp_prob
+                        ):
+                            worst_fp_prob = prob
+                            worst_fp_path = Path(path)
+                            worst_fp_label = f"Worst FP (prob={prob:.3f})"
+                            worst_fp_file_tag = f"{_safe_filename(file_list, idx)}_FP_p{prob:.3f}"
                     elif pred == 0 and label == 1:
                         false_catalog["false_negatives"].append(
                             {"file": path, "prob": prob, "label": label, "pred": pred}
                         )
+                        ef_val = -1.0
+                        if ef_flat is not None and i < ef_flat.numel():
+                            ef_candidate = float(ef_flat[i])
+                            if math.isfinite(ef_candidate):
+                                ef_val = ef_candidate
+                        if (
+                            worst_fn_path is None
+                            or ef_val > worst_fn_ef
+                            or (math.isclose(ef_val, worst_fn_ef) and prob < worst_fn_prob)
+                        ):
+                            worst_fn_ef = ef_val
+                            worst_fn_prob = prob
+                            worst_fn_path = Path(path)
+                            ef_tag = int(ef_val) if ef_val >= 0 else -1
+                            worst_fn_label = f"Worst FN (EF{ef_tag} prob={prob:.3f})"
+                            worst_fn_file_tag = f"{_safe_filename(file_list, idx)}_FN_EF{ef_tag}_p{prob:.3f}"
             sample_index += batch_size
 
     metrics = metric_collection.compute()
@@ -1727,6 +1768,26 @@ def main():
             non_retagged_root=args.non_retagged_root,
             retagged_root=DATA_ROOT_PATH,
             file_tag=weak_success_file_tag,
+        )
+    if worst_fn_path is not None:
+        _plot_success_case(
+            worst_fn_path,
+            input_variables,
+            eval_out_dir,
+            worst_fn_label,
+            non_retagged_root=args.non_retagged_root,
+            retagged_root=DATA_ROOT_PATH,
+            file_tag=worst_fn_file_tag,
+        )
+    if worst_fp_path is not None:
+        _plot_success_case(
+            worst_fp_path,
+            input_variables,
+            eval_out_dir,
+            worst_fp_label,
+            non_retagged_root=args.non_retagged_root,
+            retagged_root=DATA_ROOT_PATH,
+            file_tag=worst_fp_file_tag,
         )
     if false_catalog:
         out_path = eval_out_dir / "false_cases.json"
