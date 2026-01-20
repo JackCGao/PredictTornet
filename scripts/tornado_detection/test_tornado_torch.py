@@ -954,11 +954,12 @@ def _plot_metric_curves(
             [tvs_auc],
             marker="v",
             color="black",
-            label=f"TVS ({tvs_auc:.4f})",
+            label="TVS",
             zorder=3,
         )
         ax.set_xlabel("False Positive Rate")
         ax.set_ylabel("True Positive Rate")
+        ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.6)
         title = "ROC Curve"
         ax.set_title(title)
         ax.legend(loc="lower right")
