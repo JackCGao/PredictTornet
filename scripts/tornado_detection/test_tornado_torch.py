@@ -1028,11 +1028,20 @@ def _plot_metric_curves(
     if precision is not None and recall is not None:
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.plot(recall.cpu(), precision.cpu(), color="#2ca02c", label=model_label)
+        tvs_aucpd = 0.1583
+        ax.scatter(
+            [tvs_aucpd],
+            [tvs_aucpd],
+            marker="v",
+            color="black",
+            label="TVS",
+            zorder=3,
+        )
         ax.set_xlabel("Recall")
         ax.set_ylabel("Precision")
         title = "Precision-Recall Curve"
         ax.set_title(title)
-        ax.legend(loc="lower left")
+        ax.legend(loc="upper right")
         fig.tight_layout()
         out_path = out_dir / "pr_aucpd.png"
         fig.savefig(out_path, dpi=150)
