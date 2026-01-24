@@ -1080,6 +1080,7 @@ def _plot_success_case(
     retagged_root: Path | None = None,
     file_tag: str | None = None,
     dynamic_figsize: bool = False,
+    include_actual: bool = True,
 ):
     if plt is None:  # pragma: no cover - optional dependency
         logging.warning("matplotlib unavailable; skipping success-case plot.")
@@ -1175,7 +1176,7 @@ def _plot_success_case(
         time_idx = max(0, time_len - 1)
         _plot_from_data(fallback_data, "", "", time_idx)
 
-    if non_retagged_path is None or torn_time_idx is None:
+    if not include_actual or non_retagged_path is None or torn_time_idx is None:
         return
 
     try:
@@ -1643,6 +1644,7 @@ def main():
     false_catalog = {"false_positives": [], "false_negatives": []} if can_catalog else None
     fp_cases: List[Dict[str, Any]] = []
     fn_cases: List[Dict[str, Any]] = []
+    tp_cases: List[Dict[str, Any]] = []
     sample_index = 0
     all_probs: List[torch.Tensor] = []
     all_labels: List[torch.Tensor] = []
@@ -1732,7 +1734,7 @@ def main():
                                 weak_success_path = Path(file_list[global_idx])
                                 weak_success_label = f"{_safe_filename(file_list, global_idx)}_EF{int(ef_val)}"
                                 weak_success_file_tag = f"{weak_success_label}_weak"
-            if false_catalog:
+            if file_list:
                 ef_flat = None
                 if "ef_number" in batch:
                     ef_values = batch.get("ef_number")
@@ -1749,6 +1751,10 @@ def main():
                     label = int(labels[i].cpu())
                     pred = int(preds[i].cpu())
                     prob = float(probs[i].cpu())
+                    if pred == 1 and label == 1:
+                        tp_cases.append({"file": path, "prob": prob})
+                    if not false_catalog:
+                        continue
                     if pred == 1 and label == 0:
                         fp_cases.append({"file": path, "prob": prob})
                         false_catalog["false_positives"].append(
@@ -1903,6 +1909,25 @@ def main():
                     retagged_root=DATA_ROOT_PATH,
                     file_tag=file_tag,
                     dynamic_figsize=True,
+                )
+    if tp_cases:
+        tp_samples = _select_varied_cases(tp_cases, key="prob", n=5, reverse=True)
+        if tp_samples:
+            tp_dir = eval_out_dir / "true_positive_samples"
+            for sample in tp_samples:
+                path = Path(sample["file"])
+                prob = float(sample["prob"])
+                label = f"True Positive (prob={prob:.3f})"
+                file_tag = f"{path.stem}_TP_p{prob:.3f}"
+                _plot_success_case(
+                    path,
+                    input_variables,
+                    tp_dir,
+                    label,
+                    non_retagged_root=args.non_retagged_root,
+                    retagged_root=DATA_ROOT_PATH,
+                    file_tag=file_tag,
+                    include_actual=False,
                 )
     if args.grad_cam:
         grad_cam_out_dir = args.grad_cam_output or eval_out_dir
