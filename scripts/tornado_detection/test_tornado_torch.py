@@ -241,6 +241,56 @@ def _compute_csi(tp: float, fp: float, fn: float) -> float | None:
         return None
     return float(tp / denom)
 
+def _safe_rate(numer: float, denom: float) -> float | None:
+    if denom == 0:
+        return None
+    return float(numer / denom)
+
+def _select_varied_cases(
+    cases: List[Dict[str, Any]],
+    key: str,
+    n: int = 5,
+    reverse: bool = False,
+) -> List[Dict[str, Any]]:
+    if not cases or n <= 0:
+        return []
+    ordered = sorted(cases, key=lambda item: item.get(key, 0.0), reverse=reverse)
+    if len(ordered) <= n:
+        return ordered
+    if n == 1:
+        return [ordered[0]]
+    picks: List[Dict[str, Any]] = []
+    last_idx = len(ordered) - 1
+    used = set()
+    for i in range(n):
+        idx = int(round(i * last_idx / (n - 1)))
+        idx = max(0, min(last_idx, idx))
+        if idx in used:
+            continue
+        used.add(idx)
+        picks.append(ordered[idx])
+    return picks
+
+def _dynamic_figsize_from_limits(
+    plot_data: Dict[str, np.ndarray],
+    base: Tuple[float, float] = (12.0, 6.0),
+) -> Tuple[float, float]:
+    az_lower = float(np.asarray(plot_data.get("az_lower", [0.0]))[0])
+    az_upper = float(np.asarray(plot_data.get("az_upper", [360.0]))[0])
+    rng_lower = float(np.asarray(plot_data.get("rng_lower", [0.0]))[0])
+    rng_upper = float(np.asarray(plot_data.get("rng_upper", [1.0]))[0])
+    az_span = abs(az_upper - az_lower)
+    rng_span_km = abs(rng_upper - rng_lower) / 1e3
+    if az_span <= 0:
+        az_span = 360.0
+    if rng_span_km <= 0:
+        rng_span_km = 1.0
+    az_factor = min(2.0, max(0.5, az_span / 360.0))
+    rng_factor = min(2.0, max(0.5, rng_span_km / 150.0))
+    width = min(max(base[0] * az_factor, 6.0), 18.0)
+    height = min(max(base[1] * rng_factor, 4.0), 14.0)
+    return (width, height)
+
 def _load_training_config(checkpoint_path: Path) -> Dict[str, Any]:
     """Load the training config saved alongside a checkpoint (params.json)."""
 
@@ -1029,6 +1079,7 @@ def _plot_success_case(
     non_retagged_root: Path,
     retagged_root: Path | None = None,
     file_tag: str | None = None,
+    dynamic_figsize: bool = False,
 ):
     if plt is None:  # pragma: no cover - optional dependency
         logging.warning("matplotlib unavailable; skipping success-case plot.")
@@ -1057,7 +1108,12 @@ def _plot_success_case(
         sweep_idx = [chosen_tilt] * len(variables)
         n_rows, n_cols = _grid_for_channels(len(variables))
 
-        fig = plt.figure(figsize=(12, 6), edgecolor="k")
+        fig_size = (
+            _dynamic_figsize_from_limits(plot_data)
+            if dynamic_figsize
+            else (12.0, 6.0)
+        )
+        fig = plt.figure(figsize=fig_size, edgecolor="k")
         plot_radar(
             plot_data,
             channels=list(variables),
@@ -1585,6 +1641,8 @@ def main():
     total_loss = 0.0
     total_count = 0
     false_catalog = {"false_positives": [], "false_negatives": []} if can_catalog else None
+    fp_cases: List[Dict[str, Any]] = []
+    fn_cases: List[Dict[str, Any]] = []
     sample_index = 0
     all_probs: List[torch.Tensor] = []
     all_labels: List[torch.Tensor] = []
@@ -1692,6 +1750,7 @@ def main():
                     pred = int(preds[i].cpu())
                     prob = float(probs[i].cpu())
                     if pred == 1 and label == 0:
+                        fp_cases.append({"file": path, "prob": prob})
                         false_catalog["false_positives"].append(
                             {"file": path, "prob": prob, "label": label, "pred": pred}
                         )
@@ -1704,6 +1763,7 @@ def main():
                             worst_fp_label = f"Worst FP (prob={prob:.3f})"
                             worst_fp_file_tag = f"{_safe_filename(file_list, idx)}_FP_p{prob:.3f}"
                     elif pred == 0 and label == 1:
+                        fn_cases.append({"file": path, "prob": prob})
                         false_catalog["false_negatives"].append(
                             {"file": path, "prob": prob, "label": label, "pred": pred}
                         )
@@ -1728,10 +1788,19 @@ def main():
     metrics = metric_collection.compute()
     tp, fp, tn, fn, _ = (s.item() for s in stat_scores.compute())
     csi = _compute_csi(tp, fp, fn)
+    detection_rate = _safe_rate(tp, tp + fn)
+    false_positive_rate = _safe_rate(fp, fp + tn)
+    false_negative_rate = _safe_rate(fn, fn + tp)
     avg_loss = total_loss / max(total_count, 1)
     metrics = {"Loss": avg_loss, **{k: float(v.cpu()) for k, v in metrics.items()}}
     if csi is not None:
         metrics["CSI"] = csi
+    if detection_rate is not None:
+        metrics["DetectionRatePct"] = detection_rate * 100.0
+    if false_positive_rate is not None:
+        metrics["FalsePositivePct"] = false_positive_rate * 100.0
+    if false_negative_rate is not None:
+        metrics["FalseNegativePct"] = false_negative_rate * 100.0
     logging.info("Evaluation metrics: %s", metrics)
     eval_out_dir = checkpoint_path.resolve().parent.parent
     if all_probs and all_labels:
@@ -1799,6 +1868,42 @@ def main():
             len(false_catalog["false_negatives"]),
             out_path,
         )
+        fp_samples = _select_varied_cases(fp_cases, key="prob", n=5, reverse=True)
+        fn_samples = _select_varied_cases(fn_cases, key="prob", n=5, reverse=False)
+        if fp_samples:
+            fp_dir = eval_out_dir / "false_positives_samples"
+            for sample in fp_samples:
+                path = Path(sample["file"])
+                prob = float(sample["prob"])
+                label = f"False Positive (prob={prob:.3f})"
+                file_tag = f"{path.stem}_FP_p{prob:.3f}"
+                _plot_success_case(
+                    path,
+                    input_variables,
+                    fp_dir,
+                    label,
+                    non_retagged_root=args.non_retagged_root,
+                    retagged_root=DATA_ROOT_PATH,
+                    file_tag=file_tag,
+                    dynamic_figsize=True,
+                )
+        if fn_samples:
+            fn_dir = eval_out_dir / "false_negatives_samples"
+            for sample in fn_samples:
+                path = Path(sample["file"])
+                prob = float(sample["prob"])
+                label = f"False Negative (prob={prob:.3f})"
+                file_tag = f"{path.stem}_FN_p{prob:.3f}"
+                _plot_success_case(
+                    path,
+                    input_variables,
+                    fn_dir,
+                    label,
+                    non_retagged_root=args.non_retagged_root,
+                    retagged_root=DATA_ROOT_PATH,
+                    file_tag=file_tag,
+                    dynamic_figsize=True,
+                )
     if args.grad_cam:
         grad_cam_out_dir = args.grad_cam_output or eval_out_dir
         _generate_grad_cam_plots(
